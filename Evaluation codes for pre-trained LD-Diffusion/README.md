@@ -1,6 +1,6 @@
 # Evaluation module and pre-trained model for Training Diffusion-based Generative Models with Limited Data
 
-We provide the evaluation module and pre-trained LD-Diffusion model on the 100-shot-obama dataset. This code is only used to evaluate the pre-trained LD-Diffusion models. 
+We provide the evaluation module and pre-trained LD-Diffusion model on the 100-shot-obama dataset[[link]](https://drive.google.com/file/d/1yJsVgF4s8oh-eukOYebNSQZpGzlsEqvD/view?usp=sharing). This code is only used to evaluate the pre-trained LD-Diffusion models. 
 
 ## Requirement: 
 Use the following commands with Miniconda3 to create and activate your edm Python environment.
