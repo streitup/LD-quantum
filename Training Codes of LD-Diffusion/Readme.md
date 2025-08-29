@@ -38,7 +38,7 @@ torchrun --standalone --nproc_per_node=1 train.py --outdir=training-runs --data=
 
 2. We have also found that certain hyperparameters during both training and sampling processes — even those adopted from previous work — as well as inherent properties of the dataset, can influence the performance of LD-Diffusion. If you wish to train or apply LD-Diffusion on your own dataset, we recommend tuning the hyperparameters specifically for your dataset to achieve optimal performance.
 
-3.It will take about 4 days on one 4090 GPU with 40000kimg iteration on low-shot datasets, and the checkpoint is saved in training-runs/.
+3. It will take about 4 days on one 4090 GPU with 40000kimg iteration on low-shot datasets, and the checkpoint is saved in training-runs/.
 
 4. You should select the checkpoint to use the provided evaluation module to choose the best checkpoint. The result of the pre-trained LD-Diffusion model you selected should be close to the FID value reported in the paper.
 
