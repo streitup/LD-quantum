@@ -326,8 +326,8 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, x_start, y_sta
 
     if on_latents:
         # img_vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2", subfolder="vae").to(device)
-        # img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
-        img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
+        img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
+        # img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
         img_vae.eval()
         set_requires_grad(img_vae, False)
         latent_scale_factor = 0.18215
