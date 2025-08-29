@@ -31,4 +31,5 @@ python fid.py ref --data=100-shot-obama.zip --dest=fid-refs/100-shot-obama.npz
 torchrun --standalone --nproc_per_node=2 fid.py calc --images=fid-tmp --ref=fid-refs/100-shot-obama.npz
 ```
 
-The evaluation result of the pre-trained LD-Diffusion model should be close to the FID value reported in the paper. Due to the large size of the pre-trained model, we only provide one pre-trained model on 100-shot-obama dataset here. We will release all training codes and pre-trained models of LD-Diffusion on different datasets once the paper is accepted.
+The evaluation result of the pre-trained LD-Diffusion model should be close to the FID value reported in the paper. Due to the large size of the pre-trained model, we only provide one pre-trained model on 100-shot-obama dataset here.
+
