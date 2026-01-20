@@ -671,7 +671,8 @@ class QuantumFrontEndQCNN(nn.Module):
                  n_layers: int = 2, freeze_qcnn: bool = False, device_name: Optional[str] = None,
                  time_emb_module: Optional[nn.Module] = None,
                  use_strided_cnot: bool = False,
-                 reupload_data: bool = False):
+                 reupload_data: bool = False,
+                 max_qdev_bsz: int = 4096):
         super().__init__()
         self.channels = channels
         self.style_dim = style_dim
@@ -694,13 +695,15 @@ class QuantumFrontEndQCNN(nn.Module):
         self.eps = 1e-9
         self._printed_exec = False
         self.active_layers = n_layers # For layer-wise training
+        self.max_qdev_bsz = int(max_qdev_bsz)
 
         # Pre-processing: Patch extraction via Unfold + Dimension Reduction
         # Assume 3x3 kernel for local context
         self.kernel_size = 3
         self.padding = 1
+        self.stride = 2
         self.patch_dim = channels * self.kernel_size * self.kernel_size
-        self.unfold = nn.Unfold(kernel_size=self.kernel_size, padding=self.padding, stride=1)
+        self.unfold = nn.Unfold(kernel_size=self.kernel_size, padding=self.padding, stride=self.stride)
         
         # Project Patch to Data Qubits dimension (for encoding)
         self.data_proj = nn.Linear(self.patch_dim, n_qubits_data)
@@ -761,9 +764,9 @@ class QuantumFrontEndQCNN(nn.Module):
         B, C, H, W = x.shape
         
         # 1. Unfold & Reshape
-        patches = self.unfold(x) # [B, patch_dim, L], L=H*W
+        patches = self.unfold(x)
         L = patches.shape[-1]
-        patches_flat = patches.transpose(1, 2).reshape(-1, self.patch_dim) # [N_samples, patch_dim]
+        patches_flat = patches.transpose(1, 2).reshape(-1, self.patch_dim)
         
         # 2. Build classical style parameters via QMLP (once per batch) or pass-through
         # QMLP outputs [B, style_dim] as classical parameters; expand to pixels
@@ -771,69 +774,65 @@ class QuantumFrontEndQCNN(nn.Module):
             style_base = self.time_emb_module(style)  # [B, style_dim]
         else:
             style_base = style  # [B, style_dim]
-        style_flat = style_base.view(B, 1, 1, -1).expand(B, H, W, -1).reshape(-1, self.style_dim)
-        data_angles = torch.tanh(self.data_proj(patches_flat.to(self.data_proj.weight.dtype))) * math.pi
-        style_data_angles = torch.tanh(self.style_to_data(style_flat.to(self.style_to_data.weight.dtype))) * math.pi
+        H_out = int((H + 2 * self.padding - self.kernel_size) / self.stride + 1)
+        W_out = int((W + 2 * self.padding - self.kernel_size) / self.stride + 1)
+        style_flat = style_base.view(B, 1, 1, -1).expand(B, H_out, W_out, -1).reshape(-1, self.style_dim)
         bsz = patches_flat.shape[0]
         dev = x.device
         device_name = self.device_name or x.device.type
-        qdev = tq.QuantumDevice(n_wires=self.n_qubits_data, bsz=bsz, device=device_name)
-        if device_name == 'cpu':
-            data_angles = data_angles.to('cpu')
-            style_data_angles = style_data_angles.to('cpu')
-        for i in range(self.n_qubits_data):
-            tqf.ry(qdev, wires=i, params=(data_angles[:, i] + style_data_angles[:, i]))
-        for l in range(self.active_layers):
-            # 1. Local Rotations (RY/RZ) on Data Qubits
+        step_dyn = B * L
+        outs = []
+        start = 0
+        while start < bsz:
+            end = min(start + step_dyn, bsz)
+            sub_patches = patches_flat[start:end]
+            sub_style   = style_flat[start:end]
+            sub_da = torch.tanh(self.data_proj(sub_patches.to(self.data_proj.weight.dtype))) * math.pi
+            sub_sa = torch.tanh(self.style_to_data(sub_style.to(self.style_to_data.weight.dtype))) * math.pi
+            sub_bsz = end - start
+            qdev = tq.QuantumDevice(n_wires=self.n_qubits_data, bsz=sub_bsz, device=device_name)
             for i in range(self.n_qubits_data):
-                # Expand params to [bsz]
-                ry_params = self.qcnn_rot_params[l, i, 0, 0].unsqueeze(0).expand(bsz)
-                rz_params = self.qcnn_rot_params[l, i, 1, 0].unsqueeze(0).expand(bsz)
-                if device_name == 'cpu':
-                    ry_params = ry_params.to('cpu')
-                    rz_params = rz_params.to('cpu')
-                tqf.ry(qdev, wires=i, params=ry_params)
-                tqf.rz(qdev, wires=i, params=rz_params)
-                
-            # 2. Multi-scale Entanglement (Ring CNOTs + Strided CNOTs)
-            # Nearest Neighbor
+                tqf.ry(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
+            for l in range(self.active_layers):
+                for i in range(self.n_qubits_data):
+                    ry_params = self.qcnn_rot_params[l, i, 0, 0].unsqueeze(0).expand(sub_bsz)
+                    rz_params = self.qcnn_rot_params[l, i, 1, 0].unsqueeze(0).expand(sub_bsz)
+                    tqf.ry(qdev, wires=i, params=ry_params)
+                    tqf.rz(qdev, wires=i, params=rz_params)
+                for i in range(self.n_qubits_data):
+                    tqf.cnot(qdev, wires=[i, (i + 1) % self.n_qubits_data])
+                if self.use_strided_cnot and self.n_qubits_data >= 4:
+                    for i in range(self.n_qubits_data):
+                        tqf.cnot(qdev, wires=[i, (i + 2) % self.n_qubits_data])
+                if self.reupload_data and (l < self.active_layers - 1):
+                    for i in range(self.n_qubits_data):
+                        tqf.rz(qdev, wires=i, params=sub_da[:, i])
             for i in range(self.n_qubits_data):
-                tqf.cnot(qdev, wires=[i, (i + 1) % self.n_qubits_data])
-            
-            # Optional strided entanglement for additional mixing
-            if self.use_strided_cnot and self.n_qubits_data >= 4:
-                for i in range(self.n_qubits_data):
-                    tqf.cnot(qdev, wires=[i, (i + 2) % self.n_qubits_data])
-                
-            # --- C. Data Re-uploading ---
-            # Optional: Re-encode data using RZ between layers
-            if self.reupload_data and (l < self.active_layers - 1):
-                for i in range(self.n_qubits_data):
-                    tqf.rz(qdev, wires=i, params=data_angles[:, i])
-                    
-        # 5. Trainable Measurement Basis
-        # Apply U3(theta, phi, lam) on Data Qubits
-        for i in range(self.n_qubits_data):
-            params_expanded = self.measure_params[i].unsqueeze(0).expand(bsz, -1)
-            if device_name == 'cpu':
-                params_expanded = params_expanded.to('cpu')
-            tqf.u3(qdev, wires=i, params=params_expanded)
-            
-        # 6. Measurement (Z-basis on Data Qubits only)
-        # Use MeasureAll to get expectation values for all wires, then slice
-        all_expvals = self.measure_z(qdev) # [N_samples, n_wires]
-        quant_out = all_expvals[:, :self.n_qubits_data] # [N_samples, n_qubits_data]
+                params_expanded = self.measure_params[i].unsqueeze(0).expand(sub_bsz, -1)
+                tqf.u3(qdev, wires=i, params=params_expanded)
+            all_expvals = self.measure_z(qdev)
+            outs.append(all_expvals[:, :self.n_qubits_data])
+            start = end
+        quant_out = torch.cat(outs, dim=0)
         
         # 7. Post-processing & Residual
         # Cast quant_out to out_proj weight dtype (fp16/fp32)
-        out_quant = self.out_proj(quant_out.to(self.out_proj.weight.device, dtype=self.out_proj.weight.dtype))
-        # Cast patches_flat to res_proj device/dtype
-        out_res = self.res_proj(patches_flat.to(self.res_proj.weight.device, dtype=self.res_proj.weight.dtype))
-        
+        oq = []
+        orp = []
+        step = step_dyn
+        for s in range(0, bsz, step):
+            e = min(s + step, bsz)
+            sub_q = quant_out[s:e].to(self.out_proj.weight.device, dtype=self.out_proj.weight.dtype)
+            oq.append(self.out_proj(sub_q))
+            sub_p = patches_flat[s:e].to(self.res_proj.weight.device, dtype=self.res_proj.weight.dtype)
+            orp.append(self.res_proj(sub_p))
+        out_quant = torch.cat(oq, dim=0)
+        out_res = torch.cat(orp, dim=0)
         out_flat = out_quant + out_res
         
         # 8. Reshape back
-        out = out_flat.view(B, H, W, self.channels).permute(0, 3, 1, 2)
+        out = out_flat.view(B, H_out, W_out, self.channels).permute(0, 3, 1, 2)
+        out = F.interpolate(out, size=(H, W), mode='nearest')
         return out.to(x.device, dtype=x.dtype)
 
 

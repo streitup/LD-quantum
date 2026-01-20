@@ -1,0 +1,82 @@
+{
+  "dataset_kwargs": {
+    "class_name": "training.dataset.ImageFolderDataset",
+    "path": "/home/zzn/qfl_tq/LD-Diffusion-quantum-v3/Training Codes of LD-Diffusion/100-shot-obama-128.zip",
+    "use_labels": false,
+    "xflip": false,
+    "cache": true,
+    "resolution": 128,
+    "max_size": 100
+  },
+  "data_loader_kwargs": {
+    "pin_memory": true,
+    "num_workers": 1,
+    "prefetch_factor": 2
+  },
+  "network_kwargs": {
+    "model_type": "SongUNet",
+    "embedding_type": "fourier",
+    "encoder_type": "residual",
+    "decoder_type": "standard",
+    "channel_mult_noise": 2,
+    "resample_filter": [
+      1,
+      3,
+      3,
+      1
+    ],
+    "model_channels": 64,
+    "channel_mult": [
+      2,
+      2,
+      2
+    ],
+    "class_name": "training.networks.EDMPrecond",
+    "augment_dim": 9,
+    "dropout": 0.0,
+    "use_fp16": false,
+    "use_quantum_mlp": false,
+    "use_quantum_affine": false,
+    "use_qcnn_frontend": true,
+    "qcnn_chunk_size": 1024,
+    "qcnn_use_strided": true,
+    "qcnn_reupload": true
+  },
+  "loss_kwargs": {
+    "class_name": "training.loss.EDMLoss"
+  },
+  "optimizer_kwargs": {
+    "class_name": "torch.optim.Adam",
+    "lr": 0.001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08
+  },
+  "real_p": 0.5,
+  "train_on_latents": true,
+  "progressive": false,
+  "augment_kwargs": {
+    "class_name": "training.augment.AugmentPipe",
+    "p": 0.12,
+    "xflip": 100000000.0,
+    "yflip": 1,
+    "scale": 1,
+    "rotate_frac": 1,
+    "aniso": 1,
+    "translate_frac": 1
+  },
+  "device": "cuda",
+  "total_kimg": 20,
+  "ema_halflife_kimg": 500,
+  "batch_size": 24,
+  "batch_gpu": 24,
+  "loss_scaling": 1.0,
+  "cudnn_benchmark": true,
+  "kimg_per_tick": 10,
+  "snapshot_ticks": 1,
+  "state_dump_ticks": 2,
+  "seed": 1274821738,
+  "run_dir": "training-runs/00005-100-shot-obama-128-uncond-ncsnpp-edm-gpus1-batch24-fp32-latent-qcnn-chunk1024-b24-c64"
+}

@@ -176,6 +176,9 @@ class UNetBlock(torch.nn.Module):
         use_quantum_transformer=False, quantum_adapter=None,
         use_quantum_affine=False,
         use_qcnn_frontend=False,
+        qcnn_chunk_size=4096,
+        qcnn_use_strided=False,
+        qcnn_reupload=False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -189,7 +192,10 @@ class UNetBlock(torch.nn.Module):
         self.use_quantum_transformer = use_quantum_transformer
         self.quantum_adapter = quantum_adapter
         self.use_quantum_affine = use_quantum_affine
-        self.use_qcnn_frontend = use_qcnn_frontend
+        self.use_qcnn_frontend = use_qcnn_frontend and (self.num_heads > 0)
+        self.qcnn_chunk_size = int(qcnn_chunk_size)
+        self.qcnn_use_strided = bool(qcnn_use_strided)
+        self.qcnn_reupload = bool(qcnn_reupload)
 
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
         self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
@@ -210,8 +216,9 @@ class UNetBlock(torch.nn.Module):
                 n_layers=1,
                 time_emb_module=self.affine,
                 device_name=dev_name,
-                use_strided_cnot=False,
-                reupload_data=False,
+                use_strided_cnot=self.qcnn_use_strided,
+                reupload_data=self.qcnn_reupload,
+                max_qdev_bsz=self.qcnn_chunk_size,
             )
         else:
             self.quantum_frontend = None
@@ -366,6 +373,9 @@ class SongUNet(torch.nn.Module):
         use_quantum_mlp = False,
         use_quantum_affine = False,
         use_qcnn_frontend = False,
+        qcnn_chunk_size = 4096,
+        qcnn_use_strided = False,
+        qcnn_reupload = False,
     ):
         assert embedding_type in ['fourier', 'positional']
         assert encoder_type in ['standard', 'skip', 'residual']
@@ -399,6 +409,9 @@ class SongUNet(torch.nn.Module):
             use_quantum_transformer=use_quantum_transformer, quantum_adapter=adapter_obj,
             use_quantum_affine=use_quantum_affine,
             use_qcnn_frontend=use_qcnn_frontend,
+            qcnn_chunk_size=qcnn_chunk_size,
+            qcnn_use_strided=qcnn_use_strided,
+            qcnn_reupload=qcnn_reupload,
         )
 
         # Mapping.
@@ -449,7 +462,9 @@ class SongUNet(torch.nn.Module):
                 cin = cout
                 cout = model_channels * mult
                 attn = (res in attn_resolutions)
-                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                _bk = dict(block_kwargs)
+                _bk.update(use_qcnn_frontend=(bool(use_qcnn_frontend) and attn))
+                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **_bk)
         skips = [block.out_channels for name, block in self.enc.items() if 'aux' not in name]
 
         # Decoder.
@@ -457,15 +472,23 @@ class SongUNet(torch.nn.Module):
         for level, mult in reversed(list(enumerate(channel_mult))):
             res = img_resolution >> level
             if level == len(channel_mult) - 1:
-                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
-                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+                _bk_attn = dict(block_kwargs)
+                _bk_attn.update(use_qcnn_frontend=bool(use_qcnn_frontend))
+                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **_bk_attn)
+                _bk_noattn = dict(block_kwargs)
+                _bk_noattn.update(use_qcnn_frontend=False)
+                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **_bk_noattn)
             else:
-                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                _bk_up = dict(block_kwargs)
+                _bk_up.update(use_qcnn_frontend=False)
+                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **_bk_up)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
                 attn = (idx == num_blocks and res in attn_resolutions)
-                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **block_kwargs)
+                _bk = dict(block_kwargs)
+                _bk.update(use_qcnn_frontend=(bool(use_qcnn_frontend) and attn))
+                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **_bk)
             if decoder_type == 'skip' or level == 0:
                 if decoder_type == 'skip' and level < len(channel_mult) - 1:
                     self.dec[f'{res}x{res}_aux_up'] = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=0, up=True, resample_filter=resample_filter)
@@ -550,6 +573,9 @@ class DhariwalUNet(torch.nn.Module):
         use_quantum_mlp = False,
         use_quantum_affine = False,
         use_qcnn_frontend = False,
+        qcnn_chunk_size = 4096,
+        qcnn_use_strided = False,
+        qcnn_reupload = False,
     ):
         super().__init__()
         self.label_dropout = label_dropout
@@ -573,7 +599,10 @@ class DhariwalUNet(torch.nn.Module):
                             # [Quantum-Integration Marker] 将量子开关与适配器传递给所有 UNetBlock
                             use_quantum_transformer=use_quantum_transformer, quantum_adapter=adapter_obj,
                             use_quantum_affine=use_quantum_affine,
-                            use_qcnn_frontend=use_qcnn_frontend)
+                            use_qcnn_frontend=use_qcnn_frontend,
+                            qcnn_chunk_size=qcnn_chunk_size,
+                            qcnn_use_strided=qcnn_use_strided,
+                            qcnn_reupload=qcnn_reupload)
 
         # Mapping.
         self.map_noise = PositionalEmbedding(num_channels=model_channels)
@@ -599,11 +628,16 @@ class DhariwalUNet(torch.nn.Module):
                 cout = model_channels * mult
                 self.enc[f'{res}x{res}_conv'] = Conv2d(in_channels=cin, out_channels=cout, kernel=3, **init)
             else:
-                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **block_kwargs)
+                _bk_down = dict(block_kwargs)
+                _bk_down.update(use_qcnn_frontend=False)
+                self.enc[f'{res}x{res}_down'] = UNetBlock(in_channels=cout, out_channels=cout, down=True, **_bk_down)
             for idx in range(num_blocks):
                 cin = cout
                 cout = model_channels * mult
-                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
+                attn = (res in attn_resolutions)
+                _bk = dict(block_kwargs)
+                _bk.update(use_qcnn_frontend=(bool(use_qcnn_frontend) and attn))
+                self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **_bk)
         skips = [block.out_channels for block in self.enc.values()]
 
         # Decoder.
@@ -611,14 +645,23 @@ class DhariwalUNet(torch.nn.Module):
         for level, mult in reversed(list(enumerate(channel_mult))):
             res = img_resolution >> level
             if level == len(channel_mult) - 1:
-                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **block_kwargs)
-                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **block_kwargs)
+                _bk_attn = dict(block_kwargs)
+                _bk_attn.update(use_qcnn_frontend=bool(use_qcnn_frontend))
+                self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **_bk_attn)
+                _bk_noattn = dict(block_kwargs)
+                _bk_noattn.update(use_qcnn_frontend=False)
+                self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **_bk_noattn)
             else:
-                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **block_kwargs)
+                _bk_up = dict(block_kwargs)
+                _bk_up.update(use_qcnn_frontend=False)
+                self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **_bk_up)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
-                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=(res in attn_resolutions), **block_kwargs)
+                attn = (res in attn_resolutions)
+                _bk = dict(block_kwargs)
+                _bk.update(use_qcnn_frontend=(bool(use_qcnn_frontend) and attn))
+                self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **_bk)
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
 

@@ -96,6 +96,9 @@ def parse_int_list(s):
 @click.option('--use_quantum_mlp', help='Enable QuantumMLP for time embedding.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--use_quantum_affine', help='Enable QuantumFrontEndQCNN (Quantum Affine) for spatial features.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--quantum-frontendqcnn', help='Enable QuantumFrontEndQCNN frontend (decoupled from affine).', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--quantum-qcnn-chunk', help='Chunk size for QCNN batched simulation (0 means no chunking).', metavar='INT', type=click.IntRange(min=0), default=1024, show_default=True)
+@click.option('--quantum-qcnn-strided', help='Enable strided CNOT entanglement in QCNN.', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--quantum-qcnn-reupload', help='Enable data re-uploading between QCNN layers.', metavar='BOOL', type=bool, default=False, show_default=True)
 
 # I/O-related.
 @click.option('--desc',          help='String to include in result dir name', metavar='STR',        type=str)
@@ -249,6 +252,9 @@ def main(**kwargs):
     c.network_kwargs.update(use_quantum_mlp=opts.use_quantum_mlp)
     c.network_kwargs.update(use_quantum_affine=opts.use_quantum_affine)
     c.network_kwargs.update(use_qcnn_frontend=opts.quantum_frontendqcnn)
+    c.network_kwargs.update(qcnn_chunk_size=opts.quantum_qcnn_chunk)
+    c.network_kwargs.update(qcnn_use_strided=opts.quantum_qcnn_strided)
+    c.network_kwargs.update(qcnn_reupload=opts.quantum_qcnn_reupload)
 
     # No legacy adapter path: quantum options are active only when arch=quantum_transformer.
 
