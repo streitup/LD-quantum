@@ -29,8 +29,63 @@ conda install diffusers
 To train your own LD-Diffusion model on the 100-shot Obama dataset, please run the following command on one GPU:
 
 ```
-torchrun --standalone --nproc_per_node=1 train.py --outdir=training-runs --data=100-shot-obama.zip --cond=0 --arch=ncsnpp --batch=64 --batch-gpu=64 --augment=0.1 --real_p=1.0 --dropout=0.1 --fp16=True --xflip=True --ls=100 --train_on_latents=1
+torchrun --standalone --nproc_per_node=1 train.py \
+  --outdir=training-runs \
+  --data=100-shot-obama.zip \
+  --cond=0 \
+  --arch=ncsnpp \
+  --batch=64 --batch-gpu=64 \
+  --augment=0.1 \
+  --real_p=1.0 \
+  --dropout=0.1 \
+  --fp16=True \
+  --xflip=True \
+  --ls=100 \
+  --train_on_latents=1
 ```
+
+Notes:
+- Default preconditioning is now set to `edm` (original EDMLoss, predicting clean target x0). You can omit `--precond` and it will use EDM by default.
+- If you want patch-based training, explicitly set `--precond=pedm`. In EDM mode, no extra position channels or patch-specific args are used.
+- When `--train_on_latents=1`, training uses diffusers `AutoencoderKL` (stabilityai/sd-vae-ft-mse) to encode images to 4-channel latents scaled by 0.18215.
+ - Default architecture is now `ncsnpp`. To enable the new Quantum Transformer model, pass `--arch=quantum_transformer` (the quantum attention path is opt-in and otherwise disabled).
+
+Quantum Transformer (QSANN) quick start:
+- Requires torchquantum. Install: `pip install torchquantum`.
+- Architecture must be set to `quantum_transformer`. Preconditioning can be `edm` (recommended for latent-space) or `pedm`.
+
+Minimal training example (EDM, latent 4-channels, QSANN attention):
+
+```
+torchrun --standalone --nproc_per_node=1 train.py \
+  --outdir=training-runs \
+  --data=100-shot-obama.zip \
+  --cond=0 \
+  --arch=quantum_transformer \
+  --precond=edm \
+  --batch=64 --batch-gpu=64 \
+  --augment=0.1 \
+  --real_p=1.0 \
+  --dropout=0.0 \
+  --fp16=True \
+  --xflip=True \
+  --ls=100 \
+  --train_on_latents=1 \
+  --model-dim=384 --heads=8 --layers=4 --patch-size=4 \
+  --quantum-n-qubits=6 --quantum-depth=2 --qk-dim=4 \
+  --quantum-attn-dropout=0.1 --quantum-attn-gate-init=0.5 \
+  --force-fp32-attn=1
+```
+
+Notes for QSANN parameters:
+- `--patch-size=4` implies 32×32 latent → L=64 tokens at resolution 128 (or 16 tokens at 64 depending on latent resolution); ensure H,W divisible by p.
+- `--quantum-n-qubits=6` is fixed for 64-d amplitude encoding.
+- `--qk-dim=4` sets the Q/K projection dimension inside QuantumAttention64.
+- `--force-fp32-attn=1` keeps attention ops in FP32 under AMP to avoid numerical issues.
+
+Docs:
+- Quantum Transformer plan and integration details: `docs/quantum_transformer_unet_plan.md`
+- Adapter and integration notes: `quantum_adapt.md`
 
 # Important notes
 
@@ -43,6 +98,65 @@ torchrun --standalone --nproc_per_node=1 train.py --outdir=training-runs --data=
 4. You should select the checkpoint to use the provided evaluation module to choose the best checkpoint. The result of the pre-trained LD-Diffusion model you selected should be close to the FID value reported in the paper.
 
 5. Feel free to contact me at zzhang55@qub.ac.uk if you have any questions.
+
+# Sampling
+
+We provide a unified `generate.py` script. For latent-space EDM sampling, add `--on_latents=1`; the script will sample 4-channel latents at 32×32 and decode them via `AutoencoderKL.decode` back to 128×128 RGB images.
+
+Example (single GPU):
+
+```
+python generate.py \
+  --network=training-runs/<RUN_DIR>/network-snapshot-<KIMG>.pkl \
+  --outdir=generated_images \
+  --seeds=0-63 \
+  --batch=64 \
+  --on_latents=1 \
+  --resolution=64
+```
+
+Tips:
+- For EDM latent sampling, `generate.py` sets latent image_size=32, resolution=32 and channel=4 internally.
+- If your model was trained with `--precond=pedm` (Patch-EDM), do not use `--on_latents`; sample as normal images and keep positional channels masked by `--mask_pos=True` if needed.
+
+Further docs:
+- Refactor plan (EDM default + latent training): docs/改造方案.md
+- Quantum Transformer replaces UNet (EDM + latent 16×16): docs/quantum_transformer_unet_plan.md
+
+Migration note (arch):
+- Older runs may have enabled quantum attention directly via flags. In the current version, the Quantum Transformer is only activated when you set `--arch=quantum_transformer`. All other `arch` values (`ncsnpp`, `ddpmpp`, `adm`) will keep classical attention paths, ignoring quantum-attention toggles.
+
+# Minimal training + sampling combo (EDM latent space)
+
+Training (EDM, latent space, single GPU):
+
+```
+torchrun --standalone --nproc_per_node=1 train.py \
+  --outdir=training-runs \
+  --data=100-shot-obama.zip \
+  --cond=0 \
+  --arch=ncsnpp \
+  --batch=64 --batch-gpu=64 \
+  --augment=0.1 \
+  --real_p=1.0 \
+  --dropout=0.1 \
+  --fp16=True \
+  --xflip=True \
+  --ls=100 \
+  --train_on_latents=1
+```
+
+Sampling (EDM, latent space, single GPU):
+
+```
+python generate.py \
+  --network=training-runs/<RUN_DIR>/network-snapshot-<KIMG>.pkl \
+  --outdir=generated_images \
+  --seeds=0-63 \
+  --batch=64 \
+  --on_latents=1 \
+  --resolution=64
+```
 
 # Citation:
 

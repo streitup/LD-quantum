@@ -49,8 +49,8 @@ def parse_int_list(s):
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
-@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm',       type=click.Choice(['vp', 've', 'edm', 'pedm']), default='pedm', show_default=True)
+@click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm|quantum_transformer',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm', 'quantum_transformer']), default='ncsnpp', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='vp|ve|edm|pedm',  type=click.Choice(['vp', 've', 'edm', 'pedm']), default='edm', show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -71,6 +71,31 @@ def parse_int_list(s):
 @click.option('--bench',         help='Enable cuDNN benchmarking', metavar='BOOL',                  type=bool, default=True, show_default=True)
 @click.option('--cache',         help='Cache dataset in CPU memory', metavar='BOOL',                type=bool, default=True, show_default=True)
 @click.option('--workers',       help='DataLoader worker processes', metavar='INT',                 type=click.IntRange(min=1), default=1, show_default=True)
+@click.option('--device',        help='Torch device to use (e.g., cuda, cuda:2, cpu).', metavar='STR', type=str, default='cuda', show_default=True)
+@click.option('--grad-clip-norm', help='Max gradient norm for clipping (None to disable).', metavar='FLOAT', type=float)
+# Quantum Transformer model options (active only when --arch=quantum_transformer).
+@click.option('--model-dim',      help='Transformer model dimension (DiT tokens_384).', metavar='INT', type=click.IntRange(min=1), default=384, show_default=True)
+@click.option('--heads',          help='Transformer heads (for classical backbone; quantum attn is single-head internally).', metavar='INT', type=click.IntRange(min=1), default=8, show_default=True)
+@click.option('--layers',         help='Number of Transformer blocks.', metavar='INT', type=click.IntRange(min=1), default=4, show_default=True)
+@click.option('--patch-size',     help='Patch size for 2D patchify/unpatchify.', metavar='INT', type=click.IntRange(min=1), default=4, show_default=True)
+@click.option('--quantum-n-qubits', help='Number of qubits for QSANN (fixed 6 for 64-d amplitude encoding).', metavar='INT', type=click.IntRange(min=1), default=6, show_default=True)
+@click.option('--quantum-depth',  help='Quantum circuit depth (Q_DEPTH).', metavar='INT', type=click.IntRange(min=1), default=2, show_default=True)
+@click.option('--quantum-encoding', help='Quantum encoding scheme.', metavar='STR', type=click.Choice(['amplitude', 'angle']), default='amplitude', show_default=True)
+@click.option('--qk-dim',         help='Q/K projection dimension from quantum measurement.', metavar='INT', type=click.IntRange(min=1), default=4, show_default=True)
+@click.option('--quantum-attn-dropout', help='Dropout applied to quantum attention output.', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=0.1, show_default=True)
+@click.option('--quantum-attn-gate-init', help='Initial value for attention residual gate.', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=0.5, show_default=True)
+@click.option('--force-fp32-attn', help='Force quantum attention computation in FP32 under AMP.', metavar='BOOL', type=bool, default=True, show_default=True)
+@click.option('--attn-type', help='Attention type for quantum_transformer backbone', metavar='quantum|classic', type=click.Choice(['quantum','classic']), default='quantum', show_default=True)
+
+# Quantum attention adapter options for classical UNet (SongUNet/DhariwalUNet).
+@click.option('--quantum-attn-in-unet', help='Enable QSANN-based attention replacement inside classical UNet blocks (SongUNet/DhariwalUNet).', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--quantum-adapter', help='Adapter path "module:Class" to import (default: QuantumTransformer.QSANNAdapter:QSANNAdapter).', metavar='STR', type=str, default='QuantumTransformer.QSANNAdapter:QSANNAdapter', show_default=True)
+@click.option('--quantum-qk-norm', help='Normalization for q/k projection inside adapter.', metavar='STR', type=click.Choice(['none', 'layernorm']), default='layernorm', show_default=True)
+@click.option('--quantum-tau', help='RBF attention temperature (if set, overrides adapter default).', metavar='FLOAT', type=float)
+@click.option('--quantum-tau-trainable', help='Whether the RBF temperature is trainable via softplus.', metavar='BOOL', type=bool, default=True, show_default=True)
+@click.option('--use_quantum_mlp', help='Enable QuantumMLP for time embedding.', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--use_quantum_affine', help='Enable QuantumFrontEndQCNN (Quantum Affine) for spatial features.', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--quantum-frontendqcnn', help='Enable QuantumFrontEndQCNN frontend (decoupled from affine).', metavar='BOOL', type=bool, default=False, show_default=True)
 
 # I/O-related.
 @click.option('--desc',          help='String to include in result dir name', metavar='STR',        type=str)
@@ -122,17 +147,27 @@ def main(**kwargs):
         raise click.ClickException(f'--data: {err}')
 
     # Network architecture.
+    # [Quantum-Integration Marker] 模型构造位置（选择底层 UNet 架构）
+    # 说明：此处根据 --arch 设置 c.network_kwargs.model_type 及其相关超参数（SongUNet 或 DhariwalUNet）。
+    # 注意：真正的底层 UNet 实例化发生在 training/networks.py 的预条件化类（*Precond）__init__ 中，
+    # 通过 self.model = globals()[model_type](...) 完成实例化。
     if opts.arch == 'ddpmpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='positional', encoder_type='standard', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
         c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
+    elif opts.arch == 'quantum_transformer':
+        # Quantum Transformer: use dedicated denoiser backbone with QSANN attention.
+        c.network_kwargs.update(model_type='QuantumTransformerDenoiser')
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
 
     # Preconditioning & loss function.
+    # [Quantum-Integration Marker] 模型构造位置（选择预条件化封装器）
+    # 说明：此处设置 c.network_kwargs.class_name 为具体预条件化类（VP/VE/EDM/Patch_EDM）。
+    # 训练循环将据此在对应的 training.networks.*Precond 类中构造 self.model（底层 UNet）。
     if opts.precond == 'vp':
         c.network_kwargs.class_name = 'training.networks.VPPrecond'
         c.loss_kwargs.class_name = 'training.loss.VPLoss'
@@ -161,6 +196,61 @@ def main(**kwargs):
     if opts.implicit_mlp:
         c.network_kwargs.implicit_mlp = True
     c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
+    # Quantum Transformer specific kwargs
+    # Device & gradient clipping.
+    if opts.device == 'cuda' and not torch.cuda.is_available():
+        c.device = 'cpu'
+    else:
+        c.device = opts.device
+
+    if opts.grad_clip_norm is not None:
+        c.grad_clip_norm = float(opts.grad_clip_norm)
+
+    if opts.arch == 'quantum_transformer':
+        c.network_kwargs.update(model_dim=opts.model_dim,
+                                num_heads=opts.heads,
+                                layers=opts.layers,
+                                patch_size=opts.patch_size,
+                                quantum_n_qubits=opts.quantum_n_qubits,
+                                quantum_q_depth=opts.quantum_depth,
+                                quantum_qk_dim=opts.qk_dim,
+                                quantum_attn_dropout=opts.quantum_attn_dropout,
+                                quantum_attn_gate_init=opts.quantum_attn_gate_init,
+                                force_fp32_attention=opts.force_fp32_attn)
+        # Pass attention type choice to transformer denoiser
+        c.network_kwargs.update(attn_type=opts.attn_type)
+
+    # Enable quantum attention inside classical UNet blocks when requested.
+    # This only applies to ddpmpp/ncsnpp/adm architectures.
+    if opts.arch in ('ddpmpp', 'ncsnpp', 'adm') and opts.quantum_attn_in_unet:
+        # Switch on quantum attention path in UNetBlock via SongUNet/DhariwalUNet constructor.
+        c.network_kwargs.update(use_quantum_transformer=True)
+        # Adapter import path (module:Class) and its kwargs.
+        adapter_path = opts.quantum_adapter
+        adapter_kwargs = dict(
+            N_QUBITS=opts.quantum_n_qubits,
+            Q_DEPTH=opts.quantum_depth,
+            qk_dim=opts.qk_dim,
+            encoding=opts.quantum_encoding,
+            attn_dropout=opts.quantum_attn_dropout,
+            qk_norm=opts.quantum_qk_norm,
+            prefer_x_interface=True,
+            force_fp32_attention=opts.force_fp32_attn,
+        )
+        if opts.quantum_tau is not None:
+            adapter_kwargs['tau'] = float(opts.quantum_tau)
+        adapter_kwargs['tau_trainable'] = bool(opts.quantum_tau_trainable)
+        c.network_kwargs.update(quantum_adapter=adapter_path, quantum_adapter_kwargs=adapter_kwargs)
+        
+    # Pass QuantumMLP and QuantumFrontEndQCNN flags to network_kwargs
+    # Default: enabling quantum MLP also enables quantum affine
+    if opts.use_quantum_mlp:
+        opts.use_quantum_affine = True
+    c.network_kwargs.update(use_quantum_mlp=opts.use_quantum_mlp)
+    c.network_kwargs.update(use_quantum_affine=opts.use_quantum_affine)
+    c.network_kwargs.update(use_qcnn_frontend=opts.quantum_frontendqcnn)
+
+    # No legacy adapter path: quantum options are active only when arch=quantum_transformer.
 
     # Training options.
     c.total_kimg = max(int(opts.duration * 1000), 1)
@@ -173,8 +263,10 @@ def main(**kwargs):
     if opts.seed is not None:
         c.seed = opts.seed
     else:
-        seed = torch.randint(1 << 31, size=[], device=torch.device('cuda'))
-        torch.distributed.broadcast(seed, src=0)
+        seed = torch.randint(1 << 31, size=[], device=torch.device('cpu'))
+        if dist.get_world_size() > 1:
+            seed = seed.to(torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+            torch.distributed.broadcast(seed, src=0)
         c.seed = int(seed)
 
     # Transfer learning and resume.
@@ -243,6 +335,10 @@ def main(**kwargs):
 
     # Train.
     training_loop.training_loop(**c)
+    # [Quantum-Integration Marker] 实例化触发点
+    # 说明：training_loop.training_loop(**c) 将读取 c.network_kwargs.class_name 和 model_type，
+    # 在 training/networks.py 的预条件化类 __init__ 中执行 self.model = globals()[model_type](...)，
+    # 完成底层 UNet 模型的实例化；UNetBlock 内 attention=True 的位置将启用自注意力（可替换为量子 Transformer）。
 
 #----------------------------------------------------------------------------
 

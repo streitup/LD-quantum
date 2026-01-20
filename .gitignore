@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+.idea/
+.venv/
+venv/
+env/
+.env
+.mypy_cache/
+.pytest_cache/
+.cache/
+
+# Outputs and run directories
+**/out-*/
+**/out-bench-*/
+
+# Logs
+**/*.log
+**/log.txt
+
+# Model checkpoints
+**/training-state-*.pt
+**/network-snapshot-*.pkl
+**/*.ckpt
+**/*.safetensors
+**/*.pth
+**/*.pt
+
+# Datasets and archives
+**/*.zip
+**/*.tar
+**/*.tar.gz
+
+# Additional generated samples and references
+Training Codes of LD-Diffusion/samples_after_2000step_latent_acc/
+Evaluation codes for pre-trained LD-Diffusion/fid-refs/

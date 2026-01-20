@@ -30,7 +30,8 @@ class VPLoss:
         weight = 1 / sigma ** 2
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
+        # 使用关键字参数传递 class_labels，以兼容 EDMPrecond.forward(x, sigma, x_pos=None, class_labels=...)
+        D_yn = net(y + n, sigma, class_labels=labels, augment_labels=augment_labels)
         loss = weight * ((D_yn - y) ** 2)
         return loss
 
@@ -55,7 +56,8 @@ class VELoss:
         weight = 1 / sigma ** 2
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
+        # 使用关键字参数传递 class_labels，以兼容 EDMPrecond.forward(x, sigma, x_pos=None, class_labels=...)
+        D_yn = net(y + n, sigma, class_labels=labels, augment_labels=augment_labels)
         loss = weight * ((D_yn - y) ** 2)
         return loss
 
@@ -76,7 +78,8 @@ class EDMLoss:
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
+        # 使用关键字参数传递 class_labels，以兼容 EDMPrecond.forward(x, sigma, x_pos=None, class_labels=...)
+        D_yn = net(y + n, sigma, class_labels=labels, augment_labels=augment_labels)
         loss = weight * ((D_yn - y) ** 2)
         return loss
 

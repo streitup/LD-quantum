@@ -23,43 +23,121 @@ from torch_utils import misc
 from diffusers import AutoencoderKL
 
 # ----------------------------------------------------------------------------
+# Snapshot/State cleanup helpers.
+# Retention policy: keep the latest N snapshots (and states) plus the best one
+# according to the lowest training loss as recorded in stats.jsonl.
+# This is executed periodically to control disk usage.
+
+def _load_stats_jsonl(run_dir):
+    """Load stats.jsonl as a list of dicts; return empty list if unavailable."""
+    path = os.path.join(run_dir, 'stats.jsonl')
+    stats = []
+    if not os.path.isfile(path):
+        return stats
+    try:
+        with open(path, 'rt') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    stats.append(obj)
+                except Exception:
+                    # Skip malformed lines.
+                    pass
+    except Exception:
+        pass
+    return stats
+
+def _parse_snapshot_kimgs(run_dir):
+    """Return sorted list of snapshot kimg integers present in run_dir."""
+    kimgs = []
+    try:
+        for fname in os.listdir(run_dir):
+            if fname.startswith('network-snapshot-') and fname.endswith('.pkl'):
+                try:
+                    num = int(fname.split('-')[-1].split('.')[0])
+                    kimgs.append(num)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return sorted(set(kimgs))
+
+def _compute_best_snapshot_kimg(run_dir, candidate_kimgs):
+    """Pick the best snapshot kimg among candidates based on lowest loss from stats.jsonl."""
+    stats = _load_stats_jsonl(run_dir)
+    best_kimg = None
+    best_loss = float('inf')
+    for obj in stats:
+        kimg = obj.get('Progress/kimg', None)
+        # Prefer mean loss; fallback to instantaneous loss if available.
+        loss = obj.get('Loss/loss.mean', obj.get('Loss/loss', None))
+        if kimg is None or loss is None:
+            continue
+        # Match closest integer kimg.
+        kimg_int = int(round(float(kimg)))
+        if kimg_int in candidate_kimgs and float(loss) < best_loss:
+            best_loss = float(loss)
+            best_kimg = kimg_int
+    return best_kimg
+
+def _cleanup_snapshots_and_states(run_dir, latest_keep=5, best_kimg=None):
+    """Remove old snapshot/state files, keeping latest N and optionally the best."""
+    # Snapshots
+    snapshot_files = []
+    try:
+        for fname in os.listdir(run_dir):
+            if fname.startswith('network-snapshot-') and fname.endswith('.pkl'):
+                try:
+                    num = int(fname.split('-')[-1].split('.')[0])
+                    snapshot_files.append((num, fname))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    snapshot_files.sort(key=lambda x: x[0])
+    keep_kimgs = set(num for num, _ in snapshot_files[-latest_keep:])
+    if best_kimg is not None:
+        keep_kimgs.add(best_kimg)
+    for num, fname in snapshot_files:
+        if num not in keep_kimgs:
+            try:
+                os.remove(os.path.join(run_dir, fname))
+            except Exception:
+                pass
+
+    # Training states
+    state_files = []
+    try:
+        for fname in os.listdir(run_dir):
+            if fname.startswith('training-state-') and fname.endswith('.pt'):
+                try:
+                    num = int(fname.split('-')[-1].split('.')[0])
+                    state_files.append((num, fname))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    state_files.sort(key=lambda x: x[0])
+    keep_state_kimgs = set(num for num, _ in state_files[-latest_keep:])
+    # Keep state corresponding to best snapshot if present.
+    if best_kimg is not None and any(num == best_kimg for num, _ in state_files):
+        keep_state_kimgs.add(best_kimg)
+    for num, fname in state_files:
+        if num not in keep_state_kimgs:
+            try:
+                os.remove(os.path.join(run_dir, fname))
+            except Exception:
+                pass
+
 
 def set_requires_grad(model, value):
     for param in model.parameters():
         param.requires_grad = value
 
 #----------------------------------------------------------------------------
-
-class MockDistribution:
-    def __init__(self, latents):
-        self.latents = latents
-    def sample(self):
-        return self.latents
-
-class MockOutput:
-    def __init__(self, sample):
-        self.sample = sample
-
-class MockVAE(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-    def eval(self):
-        pass
-    def encode(self, x):
-        # x: [B, 3, H, W] -> [B, 4, H/8, W/8]
-        B, C, H, W = x.shape
-        latents = torch.nn.functional.interpolate(x, size=(H//8, W//8), mode='nearest')
-        if C == 3:
-            latents = torch.cat([latents, latents[:, :1, :, :]], dim=1)
-        elif C == 1:
-            latents = torch.cat([latents, latents, latents, latents], dim=1)
-        return {'latent_dist': MockDistribution(latents)}
-    
-    def decode(self, z):
-        # z: [B, 4, h, w] -> [B, 3, h*8, w*8]
-        B, C, h, w = z.shape
-        rec = torch.nn.functional.interpolate(z[:, :3, :, :], size=(h*8, w*8), mode='nearest')
-        return MockOutput(rec)
 
 def training_loop(
     run_dir             = '.',      # Output directory.
@@ -87,16 +165,10 @@ def training_loop(
     real_p              = 0.5,
     train_on_latents    = False,
     progressive         = False,
-    device              = None,
-    grad_clip_norm      = None,
+    device              = torch.device('cuda'),
 ):
     # Initialize.
     start_time = time.time()
-    if isinstance(device, str):
-        device = torch.device(device)
-    if device is None:
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-
     np.random.seed((seed * dist.get_world_size() + dist.get_rank()) % (1 << 31))
     torch.manual_seed(np.random.randint(1 << 31))
     torch.backends.cudnn.benchmark = cudnn_benchmark
@@ -122,12 +194,7 @@ def training_loop(
     if train_on_latents:
         # img_vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2", subfolder="vae").to(device)
         #img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
-        try:
-            img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
-        except Exception as e:
-            dist.print0(f"Warning: Failed to load VAE from Hugging Face: {e}")
-            dist.print0("Using MockVAE instead.")
-            img_vae = MockVAE().to(device)
+        img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
         img_vae.eval()
         set_requires_grad(img_vae, False)
         latent_scale_factor = 0.18215
@@ -136,10 +203,8 @@ def training_loop(
         img_vae = None
 
     # Construct network.
-    # 根据预条件化封装器是否为 Patch_EDM 决定是否添加坐标通道。
-    precond_class_name = network_kwargs.get('class_name', '')
-    use_patch_input = ('Patch_EDMPrecond' in precond_class_name)
-    net_input_channels = img_channels + 2 if use_patch_input else img_channels
+    dist.print0('Constructing network...')
+    net_input_channels = img_channels + 2
     interface_kwargs = dict(img_resolution=img_resolution,
                             img_channels=net_input_channels,
                             out_channels=4 if train_on_latents else dataset_obj.num_channels,
@@ -150,63 +215,43 @@ def training_loop(
         with torch.no_grad():
             images = torch.zeros([batch_gpu, img_channels, net.img_resolution, net.img_resolution], device=device)
             sigma = torch.ones([batch_gpu], device=device)
-            x_pos = torch.zeros([batch_gpu, 2, net.img_resolution, net.img_resolution], device=device) if use_patch_input else None
+            x_pos = torch.zeros([batch_gpu, 2, net.img_resolution, net.img_resolution], device=device)
             labels = torch.zeros([batch_gpu, net.label_dim], device=device)
-            # 根据预条件化封装器，选择正确的 forward 参数签名预览
-            if 'Patch_EDMPrecond' in precond_class_name:
-                args = [images, sigma, x_pos, labels]
-            elif 'EDMPrecond' in precond_class_name:
-                args = [images, sigma, None, labels]
-            else:
-                args = [images, sigma, labels]
-            misc.print_module_summary(net, args, max_nesting=2)
+            misc.print_module_summary(net, [images, sigma, x_pos, labels], max_nesting=2)
 
     # Setup optimizer.
     dist.print0('Setting up optimizer...')
-    loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss or training.patch_loss.Patch_EDMLoss
-    is_patch_loss = ('class_name' in loss_kwargs) and ('Patch_EDMLoss' in loss_kwargs['class_name'])
+    loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     # Enable detection of unused parameters to avoid DDP reduction errors when certain
     # branches or adapter modules do not contribute gradients in a given iteration
     # (e.g., quantum adapter toggles, auxiliary heads, conditional paths).
-    # Configure DDP device_ids correctly: use integer index for CUDA, None for CPU.
-    ddp_device_ids = ([device.index] if (isinstance(device, torch.device) and device.type == 'cuda' and device.index is not None) else ( [0] if (isinstance(device, torch.device) and device.type == 'cuda') else None))
-    if dist.get_world_size() > 1:
-        ddp = torch.nn.parallel.DistributedDataParallel(
-            net,
-            device_ids=ddp_device_ids,
-            broadcast_buffers=False,
-            find_unused_parameters=True,
-        )
-    else:
-        ddp = net
+    ddp = torch.nn.parallel.DistributedDataParallel(
+        net,
+        device_ids=[device],
+        broadcast_buffers=False,
+        find_unused_parameters=True,
+    )
     ema = copy.deepcopy(net).eval().requires_grad_(False)
 
     # Resume training from previous snapshot.
     if resume_pkl is not None:
         dist.print0(f'Loading network weights from "{resume_pkl}"...')
-        if dist.get_rank() != 0 and torch.distributed.is_initialized():
+        if dist.get_rank() != 0:
             torch.distributed.barrier() # rank 0 goes first
         with dnnlib.util.open_url(resume_pkl, verbose=(dist.get_rank() == 0)) as f:
             data = pickle.load(f)
-        if dist.get_rank() == 0 and torch.distributed.is_initialized():
+        if dist.get_rank() == 0:
             torch.distributed.barrier() # other ranks follow
         misc.copy_params_and_buffers(src_module=data['ema'], dst_module=net, require_all=False)
         misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=False)
         del data # conserve memory
     if resume_state_dump:
         dist.print0(f'Loading training state from "{resume_state_dump}"...')
-        # PyTorch 2.6 defaults to weights_only=True for torch.load, which
-        # prevents loading arbitrary Python objects required by our persisted
-        # training state (optimizer, EMA, etc.). Since we control the source
-        # of these checkpoints, explicitly set weights_only=False here.
-        data = torch.load(resume_state_dump, map_location=torch.device('cpu'), weights_only=False)
-        misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=False)
-        try:
-            optimizer.load_state_dict(data['optimizer_state'])
-        except Exception:
-            pass
+        data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
+        misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
+        optimizer.load_state_dict(data['optimizer_state'])
         del data # conserve memory
 
     # Train.
@@ -219,32 +264,31 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
-    batch_mul_dict = {512: 1, 256: 2, 192: 8/3,  128: 4, 96: 8,  64: 16, 32: 32, 24: 128/3, 16: 64, 8: 128, 4: 256}
-    if is_patch_loss:
+    batch_mul_dict = {512: 1, 256: 2, 192: 8/3, 128: 4, 64: 16, 32: 32, 24: 128/3, 16: 64, 8: 128, 4: 256}
+    if train_on_latents:
         p_list = np.array([(1-real_p), real_p])
         patch_list = np.array([img_resolution//(4/3), img_resolution])
-        batch_mul_avg = np.sum(p_list * np.array([4/3, 1]))
+        batch_mul_avg = np.sum(p_list * np.array([4/3, 1]))  # 2
     else:
-        # 非 Patch 训练：始终使用整图尺寸，batch_mul 固定为 1
-        p_list = np.array([1.0])
-        patch_list = np.array([img_resolution])
-        batch_mul_avg = 1.0
+        p_list = np.array([(1-real_p), real_p])
+        patch_list = np.array([img_resolution//(4/3), img_resolution])
+        batch_mul_avg = np.sum(np.array(p_list) * np.array([4/3, 1])) # 2
     while True:
 
         # Accumulate gradients.
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                if is_patch_loss and progressive:
+                if progressive:
                     p_cumsum = p_list.cumsum()
                     p_cumsum[-1] = 10.
                     prog_mask = (cur_nimg // 1000 / total_kimg) <= p_cumsum
                     patch_size = int(patch_list[prog_mask][0])
                     batch_mul_avg = batch_mul_dict[patch_size] // batch_mul_dict[img_resolution]
                 else:
-                    patch_size = int(np.random.choice(patch_list, p=p_list)) if is_patch_loss else img_resolution
+                    patch_size = int(np.random.choice(patch_list, p=p_list))
 
-                batch_mul = int(batch_mul_dict[patch_size] // batch_mul_dict[img_resolution]) if is_patch_loss else 1
+                batch_mul = int(batch_mul_dict[patch_size] // batch_mul_dict[img_resolution])
                 images, labels = [], []
                 for _ in range(batch_mul):
                     images_, labels_ = next(dataset_iterator)
@@ -259,11 +303,8 @@ def training_loop(
                         images = latent_scale_factor * images
 
                 labels = labels.to(device)
-                if is_patch_loss:
-                    loss = loss_fn(net=ddp, images=images, patch_size=patch_size, resolution=img_resolution,
-                                   labels=labels, augment_pipe=augment_pipe)
-                else:
-                    loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+                loss = loss_fn(net=ddp, images=images, patch_size=patch_size, resolution=img_resolution,
+                               labels=labels, augment_pipe=augment_pipe)
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total / batch_mul).backward()
                 # loss.mean().mul(loss_scaling / batch_mul).backward()
@@ -274,13 +315,6 @@ def training_loop(
         for param in net.parameters():
             if param.grad is not None:
                 torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
-        # Gradient clipping (if enabled).
-        if grad_clip_norm is not None:
-            try:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=float(grad_clip_norm))
-                training_stats.report('Grad/clip_norm', float(grad_clip_norm))
-            except Exception:
-                pass
         optimizer.step()
 
         # Update EMA.
@@ -308,11 +342,9 @@ def training_loop(
         fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
         fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
-        if torch.cuda.is_available() and str(device).startswith('cuda'):
-            dev = torch.device(device) if not isinstance(device, torch.device) else device
-            fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(dev) / 2**30):<6.2f}"]
-            fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(dev) / 2**30):<6.2f}"]
-            torch.cuda.reset_peak_memory_stats()
+        fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
+        fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
+        torch.cuda.reset_peak_memory_stats()
         dist.print0(' '.join(fields))
 
         # Check for abort.
@@ -333,12 +365,38 @@ def training_loop(
             if dist.get_rank() == 0:
                 with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
                     pickle.dump(data, f)
+                # Immediate retention cleanup after saving a snapshot: keep latest 5 and best.
+                try:
+                    candidate_kimgs = _parse_snapshot_kimgs(run_dir)
+                    best_kimg = _compute_best_snapshot_kimg(run_dir, candidate_kimgs)
+                    _cleanup_snapshots_and_states(run_dir, latest_keep=5, best_kimg=best_kimg)
+                    dist.print0(f'Retention cleanup (post-snapshot) executed at tick {cur_tick}: kept latest 5 and best {best_kimg}.')
+                except Exception as e:
+                    dist.print0(f'Retention cleanup (post-snapshot) at tick {cur_tick} failed: {e}')
             del data # conserve memory
 
         # Save full dump of the training state.
         if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
             torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+            # Immediate retention cleanup after saving a training state.
+            try:
+                candidate_kimgs = _parse_snapshot_kimgs(run_dir)
+                best_kimg = _compute_best_snapshot_kimg(run_dir, candidate_kimgs)
+                _cleanup_snapshots_and_states(run_dir, latest_keep=5, best_kimg=best_kimg)
+                dist.print0(f'Retention cleanup (post-state) executed at tick {cur_tick}: kept latest 5 and best {best_kimg}.')
+            except Exception as e:
+                dist.print0(f'Retention cleanup (post-state) at tick {cur_tick} failed: {e}')
 
+
+        # Periodic snapshot/state retention cleanup.
+        try:
+            if dist.get_rank() == 0 and cur_tick != 0 and (cur_tick % 200 == 0):
+                candidate_kimgs = _parse_snapshot_kimgs(run_dir)
+                best_kimg = _compute_best_snapshot_kimg(run_dir, candidate_kimgs)
+                _cleanup_snapshots_and_states(run_dir, latest_keep=5, best_kimg=best_kimg)
+                dist.print0(f'Retention cleanup executed at tick {cur_tick}: kept latest 5 and best {best_kimg}.')
+        except Exception as e:
+            dist.print0(f'Retention cleanup at tick {cur_tick} failed: {e}')
 
         # Update logs.
         training_stats.default_collector.update()
@@ -359,6 +417,15 @@ def training_loop(
 
     # Done.
     dist.print0()
+    # Final retention cleanup to enforce saving policy at the end of training.
+    try:
+        if dist.get_rank() == 0:
+            candidate_kimgs = _parse_snapshot_kimgs(run_dir)
+            best_kimg = _compute_best_snapshot_kimg(run_dir, candidate_kimgs)
+            _cleanup_snapshots_and_states(run_dir, latest_keep=5, best_kimg=best_kimg)
+            dist.print0(f'Final retention cleanup executed: kept latest 5 and best {best_kimg}.')
+    except Exception as e:
+        dist.print0(f'Final retention cleanup failed: {e}')
     dist.print0('Exiting...')
 
 #----------------------------------------------------------------------------

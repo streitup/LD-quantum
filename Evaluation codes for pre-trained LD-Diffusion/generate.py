@@ -313,7 +313,8 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, x_start, y_sta
 
     # Rank 0 goes first.
     if dist.get_rank() != 0:
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     # Load network.
     dist.print0(f'Loading network from "{network_pkl}"...')
@@ -322,7 +323,8 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, x_start, y_sta
 
     # Other ranks follow.
     if dist.get_rank() == 0:
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     if on_latents:
         # img_vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2", subfolder="vae").to(device)
@@ -335,7 +337,8 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, x_start, y_sta
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
     for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
         batch_size = len(batch_seeds)
         if batch_size == 0:
             continue
@@ -393,7 +396,8 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, x_start, y_sta
                 PIL.Image.fromarray(image_np, 'RGB').save(image_path)
 
     # Done.
-    torch.distributed.barrier()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
     dist.print0('Done.')
 
 #----------------------------------------------------------------------------
