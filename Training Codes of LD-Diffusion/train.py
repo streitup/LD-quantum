@@ -93,6 +93,7 @@ def parse_int_list(s):
 @click.option('--quantum-qk-norm', help='Normalization for q/k projection inside adapter.', metavar='STR', type=click.Choice(['none', 'layernorm']), default='layernorm', show_default=True)
 @click.option('--quantum-tau', help='RBF attention temperature (if set, overrides adapter default).', metavar='FLOAT', type=float)
 @click.option('--quantum-tau-trainable', help='Whether the RBF temperature is trainable via softplus.', metavar='BOOL', type=bool, default=True, show_default=True)
+@click.option('--quantum-attn-chunk', help='Chunk size for QSANN attention batched simulation (0 disables chunking).', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--use_quantum_mlp', help='Enable QuantumMLP for time embedding.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--use_quantum_affine', help='Enable QuantumFrontEndQCNN (Quantum Affine) for spatial features.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--quantum-frontendqcnn', help='Enable QuantumFrontEndQCNN frontend (decoupled from affine).', metavar='BOOL', type=bool, default=False, show_default=True)
@@ -239,6 +240,7 @@ def main(**kwargs):
             qk_norm=opts.quantum_qk_norm,
             prefer_x_interface=True,
             force_fp32_attention=opts.force_fp32_attn,
+            attn_chunk_size=opts.quantum_attn_chunk,
         )
         if opts.quantum_tau is not None:
             adapter_kwargs['tau'] = float(opts.quantum_tau)

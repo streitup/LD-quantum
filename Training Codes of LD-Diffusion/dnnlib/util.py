@@ -89,6 +89,9 @@ class Logger(object):
         if self.should_flush:
             self.flush()
 
+    def isatty(self) -> bool:
+        return False
+
     def flush(self) -> None:
         """Flush written text to both stdout and a file, if open."""
         if self.file is not None:

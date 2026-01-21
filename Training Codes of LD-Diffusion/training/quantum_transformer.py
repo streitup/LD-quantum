@@ -696,6 +696,11 @@ class QuantumFrontEndQCNN(nn.Module):
         self._printed_exec = False
         self.active_layers = n_layers # For layer-wise training
         self.max_qdev_bsz = int(max_qdev_bsz)
+        self.reuse_device = True
+        self.cache_device = True
+        self._qdev_cached = None
+        self._qdev_cached_bsz = None
+        self._qdev_cached_devname = None
 
         # Pre-processing: Patch extraction via Unfold + Dimension Reduction
         # Assume 3x3 kernel for local context
@@ -752,6 +757,22 @@ class QuantumFrontEndQCNN(nn.Module):
         
         if _TQ_AVAILABLE:
             self.measure_z = tq.MeasureAll(tq.PauliZ)
+        try:
+            _rd_env = os.getenv('QCNN_REUSE_DEVICE', '').strip().lower()
+            if _rd_env in ('0', 'false', 'no', 'off'):
+                self.reuse_device = False
+            elif _rd_env in ('1', 'true', 'yes', 'on'):
+                self.reuse_device = True
+            _cd_env = os.getenv('QCNN_CACHE_DEVICE', '').strip().lower()
+            if _cd_env in ('0', 'false', 'no', 'off'):
+                self.cache_device = False
+            elif _cd_env in ('1', 'true', 'yes', 'on'):
+                self.cache_device = True
+            _mb_env = os.getenv('QCNN_MAX_QDEV_BSZ', '').strip()
+            if _mb_env:
+                self.max_qdev_bsz = int(_mb_env)
+        except Exception:
+            pass
 
     def set_active_layers(self, n: int):
         self.active_layers = min(max(1, n), self.n_layers)
@@ -781,16 +802,24 @@ class QuantumFrontEndQCNN(nn.Module):
         dev = x.device
         device_name = self.device_name or x.device.type
         step_dyn = B * L
+        step = bsz if self.max_qdev_bsz <= 0 else min(step_dyn, self.max_qdev_bsz)
         outs = []
         start = 0
         while start < bsz:
-            end = min(start + step_dyn, bsz)
+            end = min(start + step, bsz)
             sub_patches = patches_flat[start:end]
             sub_style   = style_flat[start:end]
             sub_da = torch.tanh(self.data_proj(sub_patches.to(self.data_proj.weight.dtype))) * math.pi
             sub_sa = torch.tanh(self.style_to_data(sub_style.to(self.style_to_data.weight.dtype))) * math.pi
             sub_bsz = end - start
-            qdev = tq.QuantumDevice(n_wires=self.n_qubits_data, bsz=sub_bsz, device=device_name)
+            if self.reuse_device and self.cache_device and self._qdev_cached is not None and self._qdev_cached_bsz == sub_bsz and self._qdev_cached_devname == device_name:
+                qdev = self._qdev_cached
+            else:
+                qdev = tq.QuantumDevice(n_wires=self.n_qubits_data, bsz=sub_bsz, device=device_name)
+                if self.cache_device:
+                    self._qdev_cached = qdev
+                    self._qdev_cached_bsz = sub_bsz
+                    self._qdev_cached_devname = device_name
             for i in range(self.n_qubits_data):
                 tqf.ry(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
             for l in range(self.active_layers):
@@ -807,9 +836,9 @@ class QuantumFrontEndQCNN(nn.Module):
                 if self.reupload_data and (l < self.active_layers - 1):
                     for i in range(self.n_qubits_data):
                         tqf.rz(qdev, wires=i, params=sub_da[:, i])
+            meas_expanded_all = self.measure_params.unsqueeze(0).expand(sub_bsz, -1, -1)
             for i in range(self.n_qubits_data):
-                params_expanded = self.measure_params[i].unsqueeze(0).expand(sub_bsz, -1)
-                tqf.u3(qdev, wires=i, params=params_expanded)
+                tqf.u3(qdev, wires=i, params=meas_expanded_all[:, i])
             all_expvals = self.measure_z(qdev)
             outs.append(all_expvals[:, :self.n_qubits_data])
             start = end
@@ -819,7 +848,7 @@ class QuantumFrontEndQCNN(nn.Module):
         # Cast quant_out to out_proj weight dtype (fp16/fp32)
         oq = []
         orp = []
-        step = step_dyn
+        step = step
         for s in range(0, bsz, step):
             e = min(s + step, bsz)
             sub_q = quant_out[s:e].to(self.out_proj.weight.device, dtype=self.out_proj.weight.dtype)

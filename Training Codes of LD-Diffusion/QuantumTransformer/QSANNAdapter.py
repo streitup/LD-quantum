@@ -23,6 +23,72 @@ except Exception:
     _TQ_AVAILABLE = False
 
 
+class _ClassicalAgg(nn.Module):
+    def __init__(self, q_proj: nn.Module, k_proj: nn.Module, qk_ln: nn.Module, tau_trainable: bool, raw_tau: torch.Tensor, tau_value: torch.Tensor, qk_dim: int):
+        super().__init__()
+        self.q_proj = q_proj
+        self.k_proj = k_proj
+        self.qk_ln = qk_ln
+        self.tau_trainable = tau_trainable
+        if tau_trainable:
+            self.raw_tau = raw_tau
+            self.register_parameter('raw_tau', self.raw_tau)
+        else:
+            self.tau_value = tau_value
+            self.register_buffer('tau_value', self.tau_value)
+        self.qk_dim = qk_dim
+
+    def forward(self, q_all: torch.Tensor, k_all: torch.Tensor, xh_value: torch.Tensor, B_H: int, S: int) -> torch.Tensor:
+        q_vec = self.q_proj(q_all)
+        q_vec = self.qk_ln(q_vec)
+        q = q_vec.reshape(B_H, S, self.qk_dim)
+        k_vec = self.k_proj(k_all)
+        k_vec = self.qk_ln(k_vec)
+        k = k_vec.reshape(B_H, S, self.qk_dim)
+        v = xh_value.transpose(1, 2)
+        if self.tau_trainable:
+            tau_eff = F.softplus(self.raw_tau) + 1e-9
+        else:
+            tau_eff = self.tau_value + 1e-9
+        q_norm = (q * q).sum(dim=2, keepdim=True)
+        k_norm = (k * k).sum(dim=2, keepdim=True)
+        cross = torch.matmul(q, k.transpose(1, 2))
+        dist_sq = q_norm + k_norm.transpose(1, 2) - 2.0 * cross
+        alpha = torch.exp(-dist_sq / tau_eff)
+        alpha_sum = alpha.sum(dim=-1, keepdim=True) + 1e-9
+        alpha_norm = alpha / alpha_sum
+        attn_out = torch.einsum('bsj,bjd->bsd', alpha_norm, v)
+        attn_out = attn_out.transpose(1, 2)
+        return attn_out
+
+def _compiled_classical_agg(q_all: torch.Tensor, k_all: torch.Tensor, xh_value: torch.Tensor, B_H: int, S: int, tau_trainable: bool, raw_tau: torch.Tensor, tau_value: torch.Tensor, q_proj_w: torch.Tensor, q_proj_b: torch.Tensor, k_proj_w: torch.Tensor, k_proj_b: torch.Tensor, ln_weight: torch.Tensor, ln_bias: torch.Tensor, ln_eps: float, qk_dim: int) -> torch.Tensor:
+    q_vec = F.linear(q_all, q_proj_w, q_proj_b)
+    if ln_weight is not None and ln_bias is not None:
+        q_vec = F.layer_norm(q_vec, (qk_dim,), ln_weight, ln_bias, ln_eps)
+    q = q_vec.reshape(B_H, S, qk_dim)
+    k_vec = F.linear(k_all, k_proj_w, k_proj_b)
+    if ln_weight is not None and ln_bias is not None:
+        k_vec = F.layer_norm(k_vec, (qk_dim,), ln_weight, ln_bias, ln_eps)
+    k = k_vec.reshape(B_H, S, qk_dim)
+    v = xh_value.transpose(1, 2)
+    if tau_trainable:
+        tau_eff = F.softplus(raw_tau) + 1e-9
+    else:
+        tau_eff = tau_value + 1e-9
+    q_norm = (q * q).sum(dim=2, keepdim=True)
+    k_norm = (k * k).sum(dim=2, keepdim=True)
+    cross = torch.matmul(q, k.transpose(1, 2))
+    dist_sq = q_norm + k_norm.transpose(1, 2) - 2.0 * cross
+    alpha = torch.exp(-dist_sq / tau_eff)
+    alpha_sum = alpha.sum(dim=-1, keepdim=True) + 1e-9
+    alpha_norm = alpha / alpha_sum
+    attn_out = torch.einsum('bsj,bjd->bsd', alpha_norm, v)
+    attn_out = attn_out.transpose(1, 2)
+    return attn_out
+
+_COMPILED_AGG_FN = None
+
+
 class QSANNAdapter(nn.Module):
     """TorchQuantum QSANN 自注意力适配器（兼容原有接口）。
 
@@ -57,7 +123,9 @@ class QSANNAdapter(nn.Module):
                  attn_dropout: float = 0.0, qk_norm: str = 'layernorm',
                  prefer_x_interface: bool = True,
                  force_fp32_attention: bool = True,
-                 device_name: str = None):
+                 device_name: str = None,
+                 attn_chunk_size: int = 0,
+                 reuse_device: bool = True):
         super().__init__()
         assert encoding in ('amplitude', 'angle'), "encoding must be 'amplitude' or 'angle'"
         assert qk_norm in ('none', 'layernorm')
@@ -70,6 +138,45 @@ class QSANNAdapter(nn.Module):
         self.force_fp32_attention = bool(force_fp32_attention)
         # 设备名：默认与 x 张量的 device 保持一致；若提供则优先使用
         self.device_name = device_name
+        self.attn_chunk_size = int(attn_chunk_size)
+        self.reuse_device = bool(reuse_device)
+        self.cache_device = True
+        self.enable_compile = True
+        self.compile_backend = 'inductor'
+        self.compile_mode = 'reduce-overhead'
+        self._qdev_cached = None
+        self._qdev_cached_bsz = None
+        self._qdev_cached_devname = None
+        self._qdev_q_cached = None
+        self._qdev_q_cached_bsz = None
+        self._qdev_q_cached_devname = None
+        self._qdev_k_cached = None
+        self._qdev_k_cached_bsz = None
+        self._qdev_k_cached_devname = None
+        try:
+            _rd_env = os.getenv('QTRANSFORMER_REUSE_DEVICE', '').strip().lower()
+            if _rd_env in ('0', 'false', 'no', 'off'):
+                self.reuse_device = False
+            elif _rd_env in ('1', 'true', 'yes', 'on'):
+                self.reuse_device = True
+            _cd_env = os.getenv('QTRANSFORMER_CACHE_DEVICE', '').strip().lower()
+            if _cd_env in ('0', 'false', 'no', 'off'):
+                self.cache_device = False
+            elif _cd_env in ('1', 'true', 'yes', 'on'):
+                self.cache_device = True
+            _cmp_env = os.getenv('QTRANSFORMER_COMPILE', '').strip().lower()
+            if _cmp_env in ('0', 'false', 'no', 'off'):
+                self.enable_compile = False
+            elif _cmp_env in ('1', 'true', 'yes', 'on'):
+                self.enable_compile = True
+            _cb_env = os.getenv('QTRANSFORMER_COMPILE_BACKEND', '').strip().lower()
+            if _cb_env:
+                self.compile_backend = _cb_env
+            _cm_env = os.getenv('QTRANSFORMER_COMPILE_MODE', '').strip().lower()
+            if _cm_env:
+                self.compile_mode = _cm_env
+        except Exception:
+            pass
 
         # 强制仅使用 TorchQuantum，实现量子注意力；不再提供经典回退
         if not _TQ_AVAILABLE:
@@ -120,6 +227,9 @@ class QSANNAdapter(nn.Module):
         self.q_proj = nn.Linear(self.N_QUBITS, self.qk_dim)
         self.k_proj = nn.Linear(self.N_QUBITS, self.qk_dim)
         self.qk_ln  = nn.LayerNorm(self.qk_dim) if qk_norm == 'layernorm' else nn.Identity()
+
+        self.classical_agg = _ClassicalAgg(self.q_proj, self.k_proj, self.qk_ln, self.tau_trainable, self.raw_tau if self.tau_trainable else None, self.tau_value if not self.tau_trainable else None, self.qk_dim)
+        
 
         # 残差门控与注意力 dropout
         attn_gate_init = 0.5 if encoding == 'angle' else 0.2
@@ -263,93 +373,138 @@ class QSANNAdapter(nn.Module):
         return out
 
     def _qsann_attention_amplitude(self, amp_complex: torch.Tensor, bsz: int, B_H: int, S: int, dev: torch.device, device_name: str, xh_value: torch.Tensor) -> torch.Tensor:
-        """严格幅度编码路径：
-        - 初态由 amp_complex 直接设定（set_states），维度为 [bsz, 2**N_QUBITS]。
-        - 对 q/k 分支分别应用 enc_w 与 q_w/k_w 的 PQC，然后测量 Z 并线性投影到 qk_dim。
-        - 注意：xh_value 用作 v（保留原通道特征）。
-        """
-        # q 分支
-        qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        # 设定初态（严格幅度编码）
-        qdev_q.set_states(amp_complex.to(torch.complex64))
-        self._apply_pqc(qdev_q, self.enc_w)
-        self._apply_pqc(qdev_q, self.q_w)
-        z_q = self._measure_z(qdev_q)           # [bsz, N_QUBITS]
-        q_vec = self.q_proj(z_q)
-        q_vec = self.qk_ln(q_vec)
-        q = q_vec.reshape(B_H, S, self.qk_dim)  # [B*H, S, qk_dim]
-
-        # k 分支
-        qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        qdev_k.set_states(amp_complex.to(torch.complex64))
-        self._apply_pqc(qdev_k, self.enc_w)
-        self._apply_pqc(qdev_k, self.k_w)
-        z_k = self._measure_z(qdev_k)
-        k_vec = self.k_proj(z_k)
-        k_vec = self.qk_ln(k_vec)
-        k = k_vec.reshape(B_H, S, self.qk_dim)
-
-        # v 使用原通道（保持维度一致）：[B*H, C_head, S] -> [B*H, S, C_head]
-        v = xh_value.transpose(1, 2)
-
-        # RBF 注意力与归一化
-        if self.tau_trainable:
-            tau_eff = F.softplus(self.raw_tau) + 1e-9
+        q_all = torch.empty((bsz, self.N_QUBITS), device=dev, dtype=torch.float32)
+        k_all = torch.empty((bsz, self.N_QUBITS), device=dev, dtype=torch.float32)
+        if self.reuse_device:
+            if self.cache_device and self._qdev_cached is not None and self._qdev_cached_bsz == bsz and self._qdev_cached_devname == device_name:
+                qdev = self._qdev_cached
+            else:
+                qdev = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+                if self.cache_device:
+                    self._qdev_cached = qdev
+                    self._qdev_cached_bsz = bsz
+                    self._qdev_cached_devname = device_name
+            self._set_states(qdev, amp_complex.to(torch.complex64))
+            self._apply_pqc(qdev, self.enc_w)
+            enc_states = self._get_states(qdev)
+            self._apply_pqc(qdev, self.q_w)
+            z_q = self._measure_z(qdev)
+            q_all[:] = z_q
+            self._set_states(qdev, enc_states)
+            self._apply_pqc(qdev, self.k_w)
+            z_k = self._measure_z(qdev)
+            k_all[:] = z_k
         else:
-            tau_eff = self.tau_value + 1e-9
-        dist_sq = torch.cdist(q, k, p=2) ** 2   # [B*H, S, S]
-        alpha = torch.exp(-dist_sq / tau_eff)
-        alpha_sum = alpha.sum(dim=-1, keepdim=True) + 1e-9
-        alpha_norm = alpha / alpha_sum
-
-        # 注意力聚合
-        attn_out = torch.einsum('bsj,bjd->bsd', alpha_norm, v)
-        attn_out = attn_out.transpose(1, 2)
+            if self.cache_device and self._qdev_q_cached is not None and self._qdev_q_cached_bsz == bsz and self._qdev_q_cached_devname == device_name:
+                qdev_q = self._qdev_q_cached
+            else:
+                qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+                if self.cache_device:
+                    self._qdev_q_cached = qdev_q
+                    self._qdev_q_cached_bsz = bsz
+                    self._qdev_q_cached_devname = device_name
+            self._set_states(qdev_q, amp_complex.to(torch.complex64))
+            self._apply_pqc(qdev_q, self.enc_w)
+            self._apply_pqc(qdev_q, self.q_w)
+            z_q = self._measure_z(qdev_q)
+            q_all[:] = z_q
+            if self.cache_device and self._qdev_k_cached is not None and self._qdev_k_cached_bsz == bsz and self._qdev_k_cached_devname == device_name:
+                qdev_k = self._qdev_k_cached
+            else:
+                qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+                if self.cache_device:
+                    self._qdev_k_cached = qdev_k
+                    self._qdev_k_cached_bsz = bsz
+                    self._qdev_k_cached_devname = device_name
+            self._set_states(qdev_k, amp_complex.to(torch.complex64))
+            self._apply_pqc(qdev_k, self.enc_w)
+            self._apply_pqc(qdev_k, self.k_w)
+            z_k = self._measure_z(qdev_k)
+            k_all[:] = z_k
+        global _COMPILED_AGG_FN
+        if _COMPILED_AGG_FN is None and self.enable_compile and hasattr(torch, 'compile'):
+            try:
+                _COMPILED_AGG_FN = torch.compile(_compiled_classical_agg, mode=self.compile_mode, backend=self.compile_backend)
+            except Exception:
+                _COMPILED_AGG_FN = None
+        if _COMPILED_AGG_FN is not None:
+            ln_weight = self.qk_ln.weight if isinstance(self.qk_ln, nn.LayerNorm) else None
+            ln_bias = self.qk_ln.bias if isinstance(self.qk_ln, nn.LayerNorm) else None
+            ln_eps = getattr(self.qk_ln, 'eps', 1e-5) if isinstance(self.qk_ln, nn.LayerNorm) else 1e-5
+            raw_tau = self.raw_tau if self.tau_trainable else torch.tensor(0.0, dtype=torch.float32, device=dev)
+            tau_value = self.tau_value if not self.tau_trainable else torch.tensor(0.0, dtype=torch.float32, device=dev)
+            attn_out = _COMPILED_AGG_FN(q_all, k_all, xh_value, B_H, S, self.tau_trainable, raw_tau, tau_value, self.q_proj.weight, self.q_proj.bias, self.k_proj.weight, self.k_proj.bias, ln_weight, ln_bias, ln_eps, self.qk_dim)
+        else:
+            attn_out = self.classical_agg(q_all, k_all, xh_value, B_H, S)
         return attn_out
 
     def _qsann_attention(self, theta: torch.Tensor, bsz: int, B_H: int, S: int, dev: torch.device, device_name: str, xh_value: torch.Tensor) -> torch.Tensor:
-        """执行 TorchQuantum QSANN 注意力：构造 q/k（通过测量 Z 并线性投影），使用 RBF 核得到权重，对 v 使用原 xh_value。"""
-        # 构造量子设备
-        qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        # 角度编码：对每个量子比特施加 RY(theta)
-        for i in range(self.N_QUBITS):
-            tqf.ry(qdev_q, wires=i, params=theta[:, i])
-        # enc + q_w 的 PQC
-        self._apply_pqc(qdev_q, self.enc_w)
-        self._apply_pqc(qdev_q, self.q_w)
-        z_q = self._measure_z(qdev_q)           # [bsz, N_QUBITS]
-        q_vec = self.q_proj(z_q)
-        q_vec = self.qk_ln(q_vec)
-        q = q_vec.reshape(B_H, S, self.qk_dim)  # [B*H, S, qk_dim]
-
-        # k 分支：重新构造设备并应用 enc + k_w
-        qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        for i in range(self.N_QUBITS):
-            tqf.ry(qdev_k, wires=i, params=theta[:, i])
-        self._apply_pqc(qdev_k, self.enc_w)
-        self._apply_pqc(qdev_k, self.k_w)
-        z_k = self._measure_z(qdev_k)
-        k_vec = self.k_proj(z_k)
-        k_vec = self.qk_ln(k_vec)
-        k = k_vec.reshape(B_H, S, self.qk_dim)  # [B*H, S, qk_dim]
-
-        # v 使用原通道（保持维度一致）：[B*H, C_head, S] -> [B*H, S, C_head]
-        v = xh_value.transpose(1, 2)            # [B*H, S, C_head]
-
-        # RBF 注意力：alpha_{s,j} = exp(-||q_s - k_j||^2 / tau)
-        if self.tau_trainable:
-            tau_eff = F.softplus(self.raw_tau) + 1e-9
+        q_all = torch.empty((bsz, self.N_QUBITS), device=dev, dtype=torch.float32)
+        k_all = torch.empty((bsz, self.N_QUBITS), device=dev, dtype=torch.float32)
+        if self.reuse_device:
+            if self.cache_device and self._qdev_cached is not None and self._qdev_cached_bsz == bsz and self._qdev_cached_devname == device_name:
+                qdev = self._qdev_cached
+            else:
+                qdev = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+                if self.cache_device:
+                    self._qdev_cached = qdev
+                    self._qdev_cached_bsz = bsz
+                    self._qdev_cached_devname = device_name
+            for i in range(self.N_QUBITS):
+                tqf.ry(qdev, wires=i, params=theta[:, i])
+            self._apply_pqc(qdev, self.enc_w)
+            enc_states = self._get_states(qdev)
+            self._apply_pqc(qdev, self.q_w)
+            z_q = self._measure_z(qdev)
+            q_all[:] = z_q
+            self._set_states(qdev, enc_states)
+            self._apply_pqc(qdev, self.k_w)
+            z_k = self._measure_z(qdev)
+            k_all[:] = z_k
         else:
-            tau_eff = self.tau_value + 1e-9
-        dist_sq = torch.cdist(q, k, p=2) ** 2   # [B*H, S, S]
-        alpha = torch.exp(-dist_sq / tau_eff)
-        alpha_sum = alpha.sum(dim=-1, keepdim=True) + 1e-9
-        alpha_norm = alpha / alpha_sum
-
-        # 注意力聚合：attn_out [B*H, S, C_head]
-        attn_out = torch.einsum('bsj,bjd->bsd', alpha_norm, v)
-        # 回到 [B*H, C_head, S]
-        attn_out = attn_out.transpose(1, 2)
+            if self.cache_device and self._qdev_q_cached is not None and self._qdev_q_cached_bsz == bsz and self._qdev_q_cached_devname == device_name:
+                qdev_q = self._qdev_q_cached
+            else:
+                qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+                if self.cache_device:
+                    self._qdev_q_cached = qdev_q
+                    self._qdev_q_cached_bsz = bsz
+                    self._qdev_q_cached_devname = device_name
+            for i in range(self.N_QUBITS):
+                tqf.ry(qdev_q, wires=i, params=theta[:, i])
+            self._apply_pqc(qdev_q, self.enc_w)
+            self._apply_pqc(qdev_q, self.q_w)
+            z_q = self._measure_z(qdev_q)
+            q_all[:] = z_q
+            if self.cache_device and self._qdev_k_cached is not None and self._qdev_k_cached_bsz == bsz and self._qdev_k_cached_devname == device_name:
+                qdev_k = self._qdev_k_cached
+            else:
+                qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+                if self.cache_device:
+                    self._qdev_k_cached = qdev_k
+                    self._qdev_k_cached_bsz = bsz
+                    self._qdev_k_cached_devname = device_name
+            for i in range(self.N_QUBITS):
+                tqf.ry(qdev_k, wires=i, params=theta[:, i])
+            self._apply_pqc(qdev_k, self.enc_w)
+            self._apply_pqc(qdev_k, self.k_w)
+            z_k = self._measure_z(qdev_k)
+            k_all[:] = z_k
+        global _COMPILED_AGG_FN
+        if _COMPILED_AGG_FN is None and self.enable_compile and hasattr(torch, 'compile'):
+            try:
+                _COMPILED_AGG_FN = torch.compile(_compiled_classical_agg, mode=self.compile_mode, backend=self.compile_backend)
+            except Exception:
+                _COMPILED_AGG_FN = None
+        if _COMPILED_AGG_FN is not None:
+            ln_weight = self.qk_ln.weight if isinstance(self.qk_ln, nn.LayerNorm) else None
+            ln_bias = self.qk_ln.bias if isinstance(self.qk_ln, nn.LayerNorm) else None
+            ln_eps = getattr(self.qk_ln, 'eps', 1e-5) if isinstance(self.qk_ln, nn.LayerNorm) else 1e-5
+            raw_tau = self.raw_tau if self.tau_trainable else torch.tensor(0.0, dtype=torch.float32, device=dev)
+            tau_value = self.tau_value if not self.tau_trainable else torch.tensor(0.0, dtype=torch.float32, device=dev)
+            attn_out = _COMPILED_AGG_FN(q_all, k_all, xh_value, B_H, S, self.tau_trainable, raw_tau, tau_value, self.q_proj.weight, self.q_proj.bias, self.k_proj.weight, self.k_proj.bias, ln_weight, ln_bias, ln_eps, self.qk_dim)
+        else:
+            attn_out = self.classical_agg(q_all, k_all, xh_value, B_H, S)
         return attn_out
 
     def _apply_pqc(self, qdev: 'tq.QuantumDevice', weights: torch.Tensor):
@@ -375,6 +530,28 @@ class QSANNAdapter(nn.Module):
             raise RuntimeError('TorchQuantum not available: cannot perform Z measurement')
         z = self.measure_z(qdev)  # [bsz, N_QUBITS]
         return z
+
+    def _get_states(self, qdev: 'tq.QuantumDevice') -> torch.Tensor:
+        try:
+            if hasattr(qdev, 'get_states'):
+                return qdev.get_states()
+            if hasattr(qdev, 'get_states_1d'):
+                return qdev.get_states_1d()
+            return qdev.states
+        except Exception:
+            return qdev.states
+
+    def _set_states(self, qdev: 'tq.QuantumDevice', states: torch.Tensor):
+        try:
+            if hasattr(qdev, 'set_states'):
+                qdev.set_states(states)
+                return
+            if hasattr(qdev, 'set_states_1d'):
+                qdev.set_states_1d(states)
+                return
+            qdev.states = states
+        except Exception:
+            qdev.states = states
 
     # 保留设备/类型一致性检查（用于防御性编程场景）
     def _check_same_device_dtype(self, *tensors):
