@@ -191,8 +191,8 @@ class UNetBlock(torch.nn.Module):
         # [Quantum-Integration Marker] 保存量子集成相关参数
         self.use_quantum_transformer = use_quantum_transformer
         self.quantum_adapter = quantum_adapter
-        self.use_quantum_affine = use_quantum_affine
-        self.use_qcnn_frontend = use_qcnn_frontend and (self.num_heads > 0)
+        # self.use_quantum_affine = use_quantum_affine # Removed
+        self.use_qcnn_frontend = use_qcnn_frontend
         self.qcnn_chunk_size = int(qcnn_chunk_size)
         self.qcnn_use_strided = bool(qcnn_use_strided)
         self.qcnn_reupload = bool(qcnn_reupload)
@@ -200,30 +200,36 @@ class UNetBlock(torch.nn.Module):
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
         self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
         
-        if self.use_quantum_affine:
-            self.affine = QuantumMLP(in_features=emb_channels, out_features=out_channels*(2 if adaptive_scale else 1), encoding='angle')
-        else:
-            # print(f"[Quantum Info] UNetBlock: Using Classical Affine/Conv (channels={out_channels}).") # Optional: uncomment if verbose
-            self.affine = Linear(in_features=emb_channels, out_features=out_channels*(2 if adaptive_scale else 1), **init)
-        # Decoupled QCNN frontend switch
+        # Classic Affine (Always used for classic path, or if we need emb projection)
+        self.affine = Linear(in_features=emb_channels, out_features=out_channels*(2 if adaptive_scale else 1), **init)
+        
+        # Architecture 2: Integrated Quantum Block (QuantumFrontEndQCNN)
         if self.use_qcnn_frontend:
             dev_name = 'cuda' if torch.cuda.is_available() else 'cpu'
+            # Architecture 2 Parameters from Benchmark 6
+            # n_groups=8, n_qubits=4, n_layers=4, stride=1
+            # Note: out_channels must be divisible by 8. If not, we might fallback or adjust.
+            n_groups = 8
+            if out_channels % n_groups != 0:
+                n_groups = 4 # Fallback
+            
             self.quantum_frontend = QuantumFrontEndQCNN(
                 channels=out_channels,
-                style_dim=out_channels*(2 if adaptive_scale else 1),
-                n_qubits_data=6,
-                n_qubits_ancilla=0,
-                n_layers=1,
-                time_emb_module=self.affine,
+                style_dim=emb_channels, # Raw embedding dimension
+                n_qubits_data=4,
+                n_qubits_ancilla=2,
+                n_layers=4, # Deep Architecture
                 device_name=dev_name,
                 use_strided_cnot=self.qcnn_use_strided,
-                reupload_data=self.qcnn_reupload,
+                reupload_data=True,
                 max_qdev_bsz=self.qcnn_chunk_size,
+                n_groups=n_groups,
+                use_strong_bypass=False, # Pure Quantum as per Architecture 2
+                use_mlp_residual=False,
+                stride=1 # We rely on conv0 for resizing
             )
         else:
             self.quantum_frontend = None
-        self.quantum_adagn = None
-        self.quantum_conv1 = None
             
         self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
         self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
@@ -244,13 +250,87 @@ class UNetBlock(torch.nn.Module):
 
     def forward(self, x, emb):
         orig = x
-        x = self.conv0(silu(self.norm0(x)))
+        
+        if self.use_qcnn_frontend and self.quantum_frontend is not None:
+            # Full Quantum Pipeline with QCNN FrontEnd:
+            # Scheme: Norm0 -> QuantumFrontEnd (Integrated) -> Skip
+            # Note: We replace Conv0 + Affine + Conv1 with a single Quantum Block.
+            
+            # 1. Handle Input Projection if channels change
+            if self.in_channels != self.out_channels:
+                # If dimensions mismatch, we must use Conv0 (or a projection) to match dimensions
+                # because QuantumFrontEnd expects fixed input dimension.
+                x = self.conv0(silu(self.norm0(x)))
+            else:
+                # If dimensions match, we skip Conv0 entirely!
+                # Direct Quantum Processing on Normalized Input
+                x = self.norm0(x)
+            
+            # 2. Integrated Quantum Block
+            # [Stability Fix] Normalize input before Quantum Circuit (Norm1)
+            # In Integrated scheme, Norm1 acts as the pre-quantum normalization.
+            x = self.norm1(x)
+            x = self.quantum_frontend(x, emb)
+            
+            # Resolution Check & Fix
+            # If skip expects high res (because block is not 'down'), but x is low res
+            if self.skip is not None:
+                 # self.skip handles resampling if needed.
+                 pass
+            else:
+                 # No skip module, so we add `orig` directly. `orig` is input resolution.
+                 # If `x` is downsampled, this fails.
+                 if x.shape[2] != orig.shape[2]:
+                      x = torch.nn.functional.interpolate(x, size=orig.shape[2:], mode='nearest')
+            
+        else:
+            # Classic Pipeline
+            x = self.conv0(silu(self.norm0(x)))
+            
+            params = self.affine(emb)
+            params = params.unsqueeze(2).unsqueeze(3).to(x.dtype)
+            if self.adaptive_scale:
+                scale, shift = params.chunk(chunks=2, dim=1)
+                x = silu(torch.addcmul(shift, self.norm1(x), scale + 1))
+            else:
+                x = silu(self.norm1(x.add_(params)))
 
+            x = self.conv1(torch.nn.functional.dropout(x, p=self.dropout, training=self.training))
+            
+        # QuantumFrontEndQCNN currently performs downsampling (stride=2).
+        # If the block is NOT a downsampling block (down=False), we must restore resolution.
+        # Check spatial mismatch and interpolate if needed.
+        if x.shape[2:] != orig.shape[2:]:
+             # Assuming x is downsampled and orig is full resolution
+             # We use nearest neighbor upsampling to match orig resolution
+             # This is a workaround until QuantumFrontEnd supports stride=1.
+             # Note: This operation is valid as it restores the spatial dimensions for the skip connection addition above?
+             # Wait, the addition `x.add_(skip(orig))` ALREADY HAPPENED on the line above!
+             # And that line crashed.
+             # So we must fix `x` BEFORE the addition.
+             pass
+
+        # Let's rewrite the forward logic slightly to handle this.
+        
         if self.use_qcnn_frontend and self.quantum_frontend is not None:
             # Full Quantum Pipeline with QCNN FrontEnd:
             # Affine (Time Gen) -> QuantumFrontEnd (Entangled Modulation + Spatial)
             # Pass raw 'emb', frontend will use affine circuit internally (no measurement)
             x = self.quantum_frontend(x, emb)
+            
+            # Resolution Check & Fix
+            # If skip expects high res (because block is not 'down'), but x is low res
+            if self.skip is not None:
+                 # self.skip handles resampling if needed.
+                 # If self.skip is Conv2d with down=True, it will downsample orig.
+                 # If self.skip is Identity (or kernel=1), it keeps orig resolution.
+                 pass
+            else:
+                 # No skip module, so we add `orig` directly. `orig` is input resolution.
+                 # If `x` is downsampled, this fails.
+                 if x.shape[2] != orig.shape[2]:
+                      x = torch.nn.functional.interpolate(x, size=orig.shape[2:], mode='nearest')
+
         else:
             # Classic or Legacy Quantum Pipeline
             params = self.affine(emb)
@@ -276,7 +356,14 @@ class UNetBlock(torch.nn.Module):
 
                 x = self.conv1(torch.nn.functional.dropout(x, p=self.dropout, training=self.training))
             
-        x = x.add_(self.skip(orig) if self.skip is not None else orig)
+        # Perform Skip Addition (Safe)
+        # Re-check resolution before addition just in case skip module output differs
+        skip_out = self.skip(orig) if self.skip is not None else orig
+        if x.shape[2:] != skip_out.shape[2:]:
+             # If x is still mismatched (e.g. QCNN downsampled but skip didn't), we conform x to skip_out
+             x = torch.nn.functional.interpolate(x, size=skip_out.shape[2:], mode='nearest')
+             
+        x = x.add_(skip_out)
         x = x * self.skip_scale
 
         if self.num_heads:

@@ -104,6 +104,15 @@ class QuantumAttention64(nn.Module):
         else:
             self.register_buffer('tau_value', torch.tensor(init_tau, dtype=torch.float32))
 
+        # Learnable Input Scaling (pre-encoding)
+        self.inp_scale = nn.Parameter(torch.ones(64))
+
+        # Trainable Measurement Basis (U3 before measurement)
+        # For Q, K (Expectation based) and V (Prob based)
+        self.meas_q_w = nn.Parameter(0.1 * torch.randn(self.N_QUBITS, 3))
+        self.meas_k_w = nn.Parameter(0.1 * torch.randn(self.N_QUBITS, 3))
+        self.meas_v_w = nn.Parameter(0.1 * torch.randn(self.N_QUBITS, 3))
+
         # numerical stability epsilon
         self.eps = 1e-9
         self._printed_exec = False
@@ -208,10 +217,61 @@ class QuantumAttention64(nn.Module):
             return out.to(x_64.device, dtype=x_64.dtype)
 
     def _forward_impl(self, x_64: torch.Tensor, device_name: str) -> torch.Tensor:
+        # Optimized implementation: Common Encoding Fork
+        # 1. Prepare common state |psi_enc> = U_enc(AmplitudeEncode(x))
         B, S, D = x_64.shape
-        q = self._q_branch(x_64, device_name)   # (B,S,qk_dim)
-        k = self._k_branch(x_64, device_name)   # (B,S,qk_dim)
-        v = self._v_branch(x_64, device_name)   # (B,S,64)
+        bsz = B * S
+        x_bsz = x_64.reshape(bsz, D)
+        
+        # Apply Input Scaling
+        x_bsz = x_bsz * self.inp_scale
+        
+        # Create common device
+        qdev_common = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        self._amplitude_encode(qdev_common, x_bsz)
+        self._apply_pqc(qdev_common, self.enc_w)
+        
+        # Get common state (Flattened)
+        if hasattr(qdev_common, 'get_states_1d'): 
+            common_states_flat = qdev_common.get_states_1d()
+        else: 
+            # Flatten if it is [B, 2, 2, ...]
+            common_states_flat = qdev_common.states.reshape(bsz, -1)
+        
+        # Prepare state for injection: [B] + [2]*N
+        target_shape = [bsz] + [2] * self.N_QUBITS
+        common_states_reshaped = common_states_flat.reshape(target_shape)
+
+        # 2. Fork to Q/K/V branches
+        # Q Branch
+        qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_q.states = common_states_reshaped.clone() # Direct set
+        self._apply_pqc(qdev_q, self.q_w)
+        # Trainable Measurement Basis
+        for i in range(self.N_QUBITS):
+            tqf.u3(qdev_q, wires=i, params=self.meas_q_w[i])
+        z_q = self.measure_z(qdev_q)
+        q = self.qk_ln(self.q_proj(z_q)).reshape(B, S, self.qk_dim)
+        
+        # K Branch
+        qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_k.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_k, self.k_w)
+        # Trainable Measurement Basis
+        for i in range(self.N_QUBITS):
+            tqf.u3(qdev_k, wires=i, params=self.meas_k_w[i])
+        z_k = self.measure_z(qdev_k)
+        k = self.qk_ln(self.k_proj(z_k)).reshape(B, S, self.qk_dim)
+        
+        # V Branch
+        qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_v.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_v, self.v_w)
+        # Trainable Measurement Basis
+        for i in range(self.N_QUBITS):
+            tqf.u3(qdev_v, wires=i, params=self.meas_v_w[i])
+        probs = self._measure_probs(qdev_v)
+        v = F.layer_norm(probs.reshape(B, S, D), normalized_shape=(D,))
 
         # RBF attention weights
         dist_sq = torch.cdist(q, k, p=2) ** 2   # (B, S, S)
@@ -342,7 +402,8 @@ class QuantumMLP(nn.Module):
     """
     def __init__(self, in_features: int, out_features: int, hidden_features: int = None,
                  n_qubits: int = 6, q_depth: int = 2, device_name: Optional[str] = None,
-                 encoding: str = 'angle', re_uploading: bool = True):
+                 encoding: str = 'amplitude', re_uploading: bool = True, output_mlp_ratio: float = 0.0,
+                 n_groups: int = 1, readout_mode: str = 'linear'):
         super().__init__()
         if not _TQ_AVAILABLE:
             raise ImportError("TorchQuantum not installed.")
@@ -357,24 +418,59 @@ class QuantumMLP(nn.Module):
         self.re_uploading = re_uploading
         self.eps = 1e-9
         self._printed_exec = False
+        self.output_mlp_ratio = output_mlp_ratio
+        self.n_groups = n_groups
+        self.readout_mode = readout_mode
+        
+        # Ensure divisibility
+        assert in_features % n_groups == 0, f"Input features {in_features} must be divisible by n_groups {n_groups}"
+        self.in_features_per_group = in_features // n_groups
         
         # 1. Classical projection
         if self.encoding == 'amplitude':
-            self.proj_in = nn.Linear(in_features, self.q_dim)
+            self.proj_in = nn.Linear(in_features, self.q_dim * self.n_groups)
             self.norm_in = nn.LayerNorm(self.q_dim)
+            self.reupload_proj = nn.Linear(in_features, self.n_qubits * self.n_groups)
         else:
-            # For angle encoding, project to n_qubits angles
-            self.proj_in = nn.Linear(in_features, self.n_qubits)
+            self.proj_in = nn.Conv1d(
+                in_channels=in_features,
+                out_channels=self.n_qubits * self.n_groups,
+                kernel_size=1,
+                groups=self.n_groups
+            )
         
         # 2. Quantum Circuit Parameters
-        self.q_weights = nn.Parameter(0.1 * torch.randn(q_depth, self.n_qubits, 3))
+        # [n_groups, depth, n_qubits, 3]
+        self.q_weights = nn.Parameter(0.1 * torch.randn(self.n_groups, q_depth, self.n_qubits, 3))
         
-        # Re-uploading weights (scales for input injection)
-        if self.re_uploading and self.encoding == 'angle':
-             self.upload_scales = nn.Parameter(torch.ones(q_depth, self.n_qubits))
+        if self.re_uploading:
+            self.upload_scales = nn.Parameter(torch.ones(self.n_groups, q_depth, self.n_qubits))
+
+        # Learnable Input Scaling
+        self.inp_scale = nn.Parameter(torch.ones(in_features))
+        
+        # Trainable Measurement Basis
+        # [n_groups, n_qubits, 3]
+        self.meas_w = nn.Parameter(0.1 * torch.randn(self.n_groups, self.n_qubits, 3))
 
         # 3. Output projection
-        self.proj_out = nn.Linear(self.q_dim, out_features)
+        # Input to projection is [B, n_groups * 2^n_qubits]
+        total_q_dim = self.n_groups * self.q_dim
+        if self.readout_mode == 'linear':
+            if self.output_mlp_ratio > 0:
+                hidden_dim = int(total_q_dim * self.output_mlp_ratio)
+                self.proj_out = nn.Sequential(
+                    nn.Linear(total_q_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, out_features)
+                )
+            else:
+                self.proj_out = nn.Linear(total_q_dim, out_features)
+        elif self.readout_mode == 'expectation':
+             self.measure_z = tq.MeasureAll(tq.PauliZ)
+             self.proj_out = None
+        else:
+            self.proj_out = None
 
     def apply_circuit(self, qdev, wires, inputs):
         """
@@ -382,61 +478,25 @@ class QuantumMLP(nn.Module):
         Used for direct integration with QCNN.
         inputs: Raw input tensor [B, in_features]
         """
+        # This method assumes SINGLE GROUP usage (legacy integration)
+        # or we need to adapt it. For now, we assume simple usage.
         # 1. Pre-process inputs
+        inputs = inputs * self.inp_scale
         if self.encoding == 'amplitude':
-            x_q = self.proj_in(inputs)
-            x_q = self.norm_in(x_q)
-            x_q = x_q / (x_q.norm(p=2, dim=-1, keepdim=True) + self.eps)
-            states = x_q.to(torch.cfloat)
-            # Amplitude encoding sets state, difficult to apply to specific wires if entangled?
-            # TorchQuantum set_states applies to ALL wires usually.
-            # If used as subsystem, we might need a workaround or assume it's initialization.
-            # Here we assume it's initialization of these wires.
-            # CAUTION: set_states on qdev sets the whole state.
-            # If wires != all wires of qdev, this is invalid for set_states.
-            # For integration, we prefer Angle Encoding.
-            if hasattr(qdev, 'set_states'): qdev.set_states(states) # Only works if qdev has matching n_wires
-            else: pass # Fallback or error?
+             # ... (existing amplitude logic)
+             pass
         else:
             # Angle Encoding
-            angles = torch.tanh(self.proj_in(inputs)) * math.pi # [-pi, pi]
-            
-            # Initial Encoding
-            for i, wire in enumerate(wires):
-                tqf.ry(qdev, wires=wire, params=angles[:, i])
-
-        # 2. PQC
-        depth = self.q_weights.shape[0]
-        for l in range(depth):
-            # Re-uploading
-            if self.re_uploading and self.encoding == 'angle':
-                for i, wire in enumerate(wires):
-                    # Inject data again
-                    scaled_angle = angles[:, i] * self.upload_scales[l, i]
-                    tqf.ry(qdev, wires=wire, params=scaled_angle)
-
-            # Variational Layers
-            rx_params = self.q_weights[l, :, 0]
-            ry_params = self.q_weights[l, :, 1]
-            ent_ry_params = self.q_weights[l, :, 2]
-            
-            for i, wire in enumerate(wires):
-                tqf.rx(qdev, wires=wire, params=rx_params[i])
-                tqf.ry(qdev, wires=wire, params=ry_params[i])
-            
-            # Entanglement (Ring)
-            n = len(wires)
-            if n > 1:
-                for i in range(n):
-                    tqf.cnot(qdev, wires=[wires[i], wires[(i + 1) % n]])
-            
-            for i, wire in enumerate(wires):
-                tqf.ry(qdev, wires=wire, params=ent_ry_params[i])
+            # Inputs: [B, in_features]
+            # Proj: Conv1d [B, in, 1] -> [B, out, 1]
+            # If n_groups > 1, this produces [B, n_groups*n_qubits]
+            # But apply_circuit typically expects simple behavior.
+            # We'll assume this is called only when n_groups=1 for legacy support
+            # OR we implement full grouped logic here too?
+            # QCNN usually calls this for TIME EMBEDDING which might not be grouped.
+            pass
 
     def _apply_pqc(self, qdev: 'tq.QuantumDevice', weights: torch.Tensor):
-        # Legacy internal method, redirected to apply_circuit if possible
-        # But apply_circuit needs 'inputs'.
-        # For backward compatibility of _apply_pqc signature, we keep it simple or deprecated.
         pass 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -448,24 +508,215 @@ class QuantumMLP(nn.Module):
         dev = x.device
         device_name = self.device_name or x.device.type
         
-        qdev = tq.QuantumDevice(n_wires=self.n_qubits, bsz=B, device=device_name)
+        # Input Scaling
+        x = x * self.inp_scale
         
-        # Use apply_circuit logic
-        # wires are 0..n_qubits-1
-        wires = list(range(self.n_qubits))
-        self.apply_circuit(qdev, wires, x)
-        
-        # 4. Measure
-        if hasattr(qdev, 'get_states'): states_out = qdev.get_states()
-        elif hasattr(qdev, 'get_states_1d'): states_out = qdev.get_states_1d()
-        else: states_out = qdev.states
-        probs = (states_out.abs() ** 2)
-        
-        # 5. Project to output
-        proj_dev = self.proj_out.weight.device
-        proj_dtype = self.proj_out.weight.dtype
-        out = self.proj_out(probs.to(proj_dev, dtype=proj_dtype))
-        return out.to(x.device, dtype=x.dtype)
+        # 1. Encoding
+        if self.encoding == 'amplitude':
+            # Support grouped amplitude encoding
+            # [B, in] -> [B, n_groups * q_dim]
+            if self.proj_in is None:
+                x_q = x
+            else:
+                x_q = self.proj_in(x)
+            
+            # Reshape to [B, n_groups, q_dim]
+            x_q = x_q.view(B, self.n_groups, self.q_dim)
+            
+            # Normalize per group state
+            x_q = x_q / (x_q.norm(p=2, dim=-1, keepdim=True) + self.eps)
+            
+            # Flatten for batch processing: [B*n_groups, q_dim]
+            states = x_q.reshape(B * self.n_groups, self.q_dim).to(torch.cfloat)
+
+            # Re-uploading angles: [B, in] -> [B, n_groups * n_qubits]
+            angles = torch.tanh(self.reupload_proj(x)) * math.pi
+            # Flatten: [B*n_groups, n_qubits]
+            angles = angles.view(B * self.n_groups, self.n_qubits)
+            
+            bsz_total = B * self.n_groups
+            depth = self.q_weights.shape[1]
+            
+            # Expand weights: [n_groups, D, Q, 3] -> [B, n_groups, D, Q, 3] -> [B*n_groups, D, Q, 3]
+            q_weights_flat = self.q_weights.unsqueeze(0).expand(B, -1, -1, -1, -1).reshape(bsz_total, -1, self.n_qubits, 3)
+            
+            if self.re_uploading:
+                # [n_groups, D, Q] -> [B*n_groups, D, Q]
+                upload_scales_flat = self.upload_scales.unsqueeze(0).expand(B, -1, -1, -1).reshape(bsz_total, -1, self.n_qubits)
+            
+            # [n_groups, Q, 3] -> [B*n_groups, Q, 3]
+            meas_w_flat = self.meas_w.unsqueeze(0).expand(B, -1, -1, -1).reshape(bsz_total, self.n_qubits, 3)
+
+            qdev = tq.QuantumDevice(n_wires=self.n_qubits, bsz=bsz_total, device=device_name)
+            if hasattr(qdev, 'set_states'):
+                qdev.set_states(states)
+            elif hasattr(qdev, 'set_states_1d'):
+                qdev.set_states_1d(states)
+            else:
+                qdev.states = states
+
+            for l in range(depth):
+                if self.re_uploading:
+                    for i in range(self.n_qubits):
+                        scaled_angle = angles[:, i] * upload_scales_flat[:, l, i]
+                        tqf.ry(qdev, wires=i, params=scaled_angle)
+                rx_params = q_weights_flat[:, l, :, 0]
+                ry_params = q_weights_flat[:, l, :, 1]
+                ent_ry_params = q_weights_flat[:, l, :, 2]
+                for i in range(self.n_qubits):
+                    tqf.rx(qdev, wires=i, params=rx_params[:, i])
+                    tqf.ry(qdev, wires=i, params=ry_params[:, i])
+                n = self.n_qubits
+                if n > 1:
+                    for i in range(n):
+                        tqf.cnot(qdev, wires=[i, (i + 1) % n])
+                for i in range(self.n_qubits):
+                    tqf.ry(qdev, wires=i, params=ent_ry_params[:, i])
+
+            for i in range(self.n_qubits):
+                tqf.u3(qdev, wires=i, params=meas_w_flat[:, i])
+
+            if self.readout_mode == 'expectation':
+                # [B*n_groups, n_qubits]
+                expval = self.measure_z(qdev)
+                # Reshape back: [B, n_groups, n_qubits]
+                expval_grouped = expval.view(B, self.n_groups, self.n_qubits)
+                # Flatten: [B, n_groups * n_qubits]
+                output_flat = expval_grouped.view(B, -1)
+            else:
+                if hasattr(qdev, 'get_states'): states_out = qdev.get_states()
+                elif hasattr(qdev, 'get_states_1d'): states_out = qdev.get_states_1d()
+                else: states_out = qdev.states
+                probs = (states_out.abs() ** 2)
+                
+                # Reshape back: [B, n_groups, 2^n_qubits]
+                probs_grouped = probs.view(B, self.n_groups, self.q_dim)
+                output_flat = probs_grouped.view(B, -1)
+
+            if self.readout_mode == 'linear':
+                if isinstance(self.proj_out, nn.Sequential):
+                    p = self.proj_out[0].weight
+                else:
+                    p = self.proj_out.weight
+                proj_dev = p.device
+                proj_dtype = p.dtype
+                out = self.proj_out(output_flat.to(proj_dev, dtype=proj_dtype))
+                return out.to(x.device, dtype=x.dtype)
+            else:
+                td = output_flat.shape[-1]
+                if td == self.out_features:
+                    return output_flat.to(x.device, dtype=x.dtype)
+                elif td > self.out_features:
+                    return output_flat[:, :self.out_features].to(x.device, dtype=x.dtype)
+                else:
+                    pad = torch.zeros(B, self.out_features - td, device=output_flat.device, dtype=output_flat.dtype)
+                    return torch.cat([output_flat, pad], dim=-1).to(x.device, dtype=x.dtype)
+        else:
+            # Angle Encoding via Grouped Conv1d
+            # [B, C] -> [B, C, 1]
+            x_in = x.unsqueeze(-1)
+            # [B, n_groups * n_qubits, 1]
+            x_enc = self.proj_in(x_in).squeeze(-1)
+            
+            # Tanh activation
+            angles = torch.tanh(x_enc) * math.pi # [B, n_groups * n_qubits]
+            
+            # Reshape for Batch Grouping
+            # [B, n_groups, n_qubits]
+            angles_grouped = angles.view(B, self.n_groups, self.n_qubits)
+            # Flatten to [B*n_groups, n_qubits]
+            angles_flat = angles_grouped.view(-1, self.n_qubits)
+            
+            # Expand Weights for Batch Grouping
+            # [n_groups, depth, n_qubits, 3] -> [B, n_groups, ...] -> [B*n_groups, ...]
+            bsz_total = B * self.n_groups
+            q_weights_flat = self.q_weights.unsqueeze(0).expand(B, -1, -1, -1, -1).reshape(bsz_total, -1, self.n_qubits, 3)
+            
+            if self.re_uploading:
+                 upload_scales_flat = self.upload_scales.unsqueeze(0).expand(B, -1, -1, -1).reshape(bsz_total, -1, self.n_qubits)
+                 
+            meas_w_flat = self.meas_w.unsqueeze(0).expand(B, -1, -1, -1).reshape(bsz_total, self.n_qubits, 3)
+            
+            # Create Quantum Device for [B*n_groups]
+            qdev = tq.QuantumDevice(n_wires=self.n_qubits, bsz=bsz_total, device=device_name)
+            
+            # Circuit Execution
+            # Initial Encoding
+            for i in range(self.n_qubits):
+                tqf.ry(qdev, wires=i, params=angles_flat[:, i])
+
+            # PQC
+            depth = self.q_weights.shape[1]
+            for l in range(depth):
+                # Re-uploading
+                if self.re_uploading and self.encoding == 'angle':
+                    for i in range(self.n_qubits):
+                        # Inject data again
+                        scaled_angle = angles_flat[:, i] * upload_scales_flat[:, l, i]
+                        tqf.ry(qdev, wires=i, params=scaled_angle)
+
+                # Variational Layers
+                rx_params = q_weights_flat[:, l, :, 0]
+                ry_params = q_weights_flat[:, l, :, 1]
+                ent_ry_params = q_weights_flat[:, l, :, 2]
+                
+                for i in range(self.n_qubits):
+                    tqf.rx(qdev, wires=i, params=rx_params[:, i])
+                    tqf.ry(qdev, wires=i, params=ry_params[:, i])
+                
+                # Entanglement (Ring)
+                n = self.n_qubits
+                if n > 1:
+                    for i in range(n):
+                        tqf.cnot(qdev, wires=[i, (i + 1) % n])
+                
+                for i in range(self.n_qubits):
+                    tqf.ry(qdev, wires=i, params=ent_ry_params[:, i])
+            
+            # Trainable Measurement Basis
+            for i in range(self.n_qubits):
+                tqf.u3(qdev, wires=i, params=meas_w_flat[:, i])
+            
+            # 4. Measure
+            if self.readout_mode == 'expectation':
+                # [B*n_groups, n_qubits]
+                expval = self.measure_z(qdev)
+                # Reshape back: [B, n_groups, n_qubits]
+                expval_grouped = expval.view(B, self.n_groups, self.n_qubits)
+                # Flatten: [B, n_groups * n_qubits]
+                output_flat = expval_grouped.view(B, -1)
+            else:
+                if hasattr(qdev, 'get_states'): states_out = qdev.get_states()
+                elif hasattr(qdev, 'get_states_1d'): states_out = qdev.get_states_1d()
+                else: states_out = qdev.states
+                
+                # [B*n_groups, 2^n_qubits]
+                probs = (states_out.abs() ** 2)
+                
+                # Reshape back: [B, n_groups, 2^n_qubits]
+                probs_grouped = probs.view(B, self.n_groups, self.q_dim)
+                
+                # Flatten: [B, n_groups * 2^n_qubits]
+                output_flat = probs_grouped.view(B, -1)
+            
+            if self.readout_mode == 'linear':
+                if isinstance(self.proj_out, nn.Sequential):
+                    p = self.proj_out[0].weight
+                else:
+                    p = self.proj_out.weight
+                proj_dev = p.device
+                proj_dtype = p.dtype
+                out = self.proj_out(output_flat.to(proj_dev, dtype=proj_dtype))
+                return out.to(x.device, dtype=x.dtype)
+            else:
+                td = output_flat.shape[-1]
+                if td == self.out_features:
+                    return output_flat.to(x.device, dtype=x.dtype)
+                elif td > self.out_features:
+                    return output_flat[:, :self.out_features].to(x.device, dtype=x.dtype)
+                else:
+                    pad = torch.zeros(B, self.out_features - td, device=output_flat.device, dtype=output_flat.dtype)
+                    return torch.cat([output_flat, pad], dim=-1).to(x.device, dtype=x.dtype)
 
 
 class QuantumAdaGN(nn.Module):
@@ -501,6 +752,147 @@ class QuantumAdaGN(nn.Module):
         
         if _TQ_AVAILABLE:
             self.measure_z = tq.MeasureAll(tq.PauliZ)
+
+    # @torch.jit.script # TQ functional calls are not scriptable due to global dict lookups
+    # @torch.compile(mode="max-autotune") # We will use torch.compile externally or on the wrapper
+    def _apply_fusion_circuit(self, qdev, sub_bsz, sub_da, interaction_wires, data_wires, 
+                              mod_params, qcnn_rot_params, 
+                              n_qubits_data: int, n_qubits_ancilla: int, active_layers: int, 
+                              use_strided_cnot: bool, reupload_data: bool):
+        # 2. Encode Data (RY)
+        # mod_params: [1, n_data, 3] or [n_layers, n_data, 3]? 
+        # In forward, we pass `chunk_mod_params` which is [sub_bsz, n_layers, n_data, 3].
+        # But here mod_params is passed as `self.mod_params` in one branch, or `chunk_mod_params` in another.
+        # Let's standardize on passing TENSORS (parameters) to this function, not `self.xxx`.
+        # The `forward` method calls this with `self.mod_params` (global) or chunked.
+        
+        # NOTE: TorchQuantum functional ops (tqf.ry, tqf.cnot) operate on qdev.
+        # They are Python loops invoking underlying kernels.
+        # To make this compilable, we need to minimize Python logic or ensure it traces well.
+        # TQ operations are generally traceable if they use standard PyTorch ops internally.
+        
+        for i in range(n_qubits_data):
+            tqf.ry(qdev, wires=i, params=sub_da[:, i])
+        
+        # 3. Entanglement (Ancilla -> Data) with Split Control
+        # This loop logic is static (structure doesn't change), so it should trace fine.
+        for i in range(n_qubits_data):
+            ancilla_idx = i % n_qubits_ancilla
+            ctl = interaction_wires[ancilla_idx]
+            tgt = data_wires[i]
+            # mod_params shape handling:
+            # If mod_params is [sub_bsz, n_layers, n_data, 3], we need to slice it.
+            # If mod_params is [n_groups, n_layers, n_data, 3], we need expansion.
+            # The caller `forward` ensures params are ready.
+            # Here we assume mod_params is [sub_bsz, n_layers, n_data, 3].
+            # Wait, `forward` passes `chunk_mod_params` which is [sub_bsz, n_layers, n_data, 3].
+            
+            # strength = mod_params[0, i, 0].expand(sub_bsz) -> This assumed mod_params was [layers, data, 3] global param.
+            # But in `forward`, we now use `chunk_mod_params` which includes batch dimension if we are in Grouped mode?
+            # In Grouped mode, we expanded params to [sub_bsz, ...].
+            # Let's verify `forward` logic.
+            
+            # In `forward`:
+            # chunk_mod_params = mod_params_expanded[s:e] -> [sub_bsz, n_layers, n_data, 3]
+            # So `mod_params` here IS [sub_bsz, n_layers, n_data, 3].
+            
+            strength = mod_params[:, 0, i, 0] # [sub_bsz]
+            
+            if ancilla_idx % 2 == 0:
+                tqf.crx(qdev, wires=[ctl, tgt], params=strength)
+            else:
+                tqf.crz(qdev, wires=[ctl, tgt], params=strength)
+        
+        # 4. Spatial QCNN Backbone
+        for l in range(active_layers):
+            for i in range(n_qubits_data):
+                ry_params = qcnn_rot_params[:, l, i, 0, 0] # [sub_bsz]
+                rz_params = qcnn_rot_params[:, l, i, 1, 0]
+                tqf.ry(qdev, wires=i, params=ry_params)
+                tqf.rz(qdev, wires=i, params=rz_params)
+            for i in range(n_qubits_data):
+                tqf.cnot(qdev, wires=[i, (i + 1) % n_qubits_data])
+            if use_strided_cnot and n_qubits_data >= 4:
+                for i in range(n_qubits_data):
+                    tqf.cnot(qdev, wires=[i, (i + 2) % n_qubits_data])
+            if reupload_data and (l < active_layers - 1):
+                for i in range(n_qubits_data):
+                    tqf.rz(qdev, wires=i, params=sub_da[:, i])
+
+    # @torch.jit.script # TQ functional calls are not scriptable due to global dict lookups
+    def _apply_fusion_circuit(self, qdev, sub_bsz, sub_da, sub_sa, interaction_wires, data_wires, 
+                              mod_params, qcnn_rot_params, 
+                              n_qubits_data: int, n_qubits_ancilla: int, active_layers: int, 
+                              use_strided_cnot: bool, reupload_data: bool):
+        # 2. Encode Data (RY)
+        for i in range(n_qubits_data):
+            tqf.ry(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
+        
+        # 3. Entanglement (Ancilla -> Data) with Split Control
+        for i in range(n_qubits_data):
+            ancilla_idx = i % n_qubits_ancilla
+            ctl = interaction_wires[ancilla_idx]
+            tgt = data_wires[i]
+            # mod_params: [n_layers, n_data, 3]
+            strength = mod_params[0, i, 0].expand(sub_bsz)
+            if ancilla_idx % 2 == 0:
+                tqf.crx(qdev, wires=[ctl, tgt], params=strength)
+            else:
+                tqf.crz(qdev, wires=[ctl, tgt], params=strength)
+        
+        # 4. Spatial QCNN Backbone
+        for l in range(active_layers):
+            for i in range(n_qubits_data):
+                ry_params = qcnn_rot_params[l, i, 0, 0].expand(sub_bsz)
+                rz_params = qcnn_rot_params[l, i, 1, 0].expand(sub_bsz)
+                tqf.ry(qdev, wires=i, params=ry_params)
+                tqf.rz(qdev, wires=i, params=rz_params)
+            for i in range(n_qubits_data):
+                tqf.cnot(qdev, wires=[i, (i + 1) % n_qubits_data])
+            if use_strided_cnot and n_qubits_data >= 4:
+                for i in range(n_qubits_data):
+                    tqf.cnot(qdev, wires=[i, (i + 2) % n_qubits_data])
+            if reupload_data and (l < active_layers - 1):
+                for i in range(n_qubits_data):
+                    # Internal Time Embedding: Re-upload both Data and Style at each layer
+                    tqf.rz(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
+
+    # @torch.jit.script # TQ functional calls are not scriptable due to global dict lookups
+    def _apply_fusion_circuit(self, qdev, sub_bsz, sub_da, interaction_wires, data_wires, 
+                              mod_params, qcnn_rot_params, 
+                              n_qubits_data: int, n_qubits_ancilla: int, active_layers: int, 
+                              use_strided_cnot: bool, reupload_data: bool):
+        # 2. Encode Data (RY)
+        for i in range(n_qubits_data):
+            tqf.ry(qdev, wires=i, params=sub_da[:, i])
+        
+        # 3. Entanglement (Ancilla -> Data) with Split Control
+        for i in range(n_qubits_data):
+            ancilla_idx = i % n_qubits_ancilla
+            ctl = interaction_wires[ancilla_idx]
+            tgt = data_wires[i]
+            # mod_params: [n_layers, n_data, 3]
+            strength = mod_params[0, i, 0].expand(sub_bsz)
+            if ancilla_idx % 2 == 0:
+                tqf.crx(qdev, wires=[ctl, tgt], params=strength)
+            else:
+                tqf.crz(qdev, wires=[ctl, tgt], params=strength)
+        
+        # 4. Spatial QCNN Backbone
+        for l in range(active_layers):
+            for i in range(n_qubits_data):
+                ry_params = qcnn_rot_params[l, i, 0, 0].expand(sub_bsz)
+                rz_params = qcnn_rot_params[l, i, 1, 0].expand(sub_bsz)
+                tqf.ry(qdev, wires=i, params=ry_params)
+                tqf.rz(qdev, wires=i, params=rz_params)
+            for i in range(n_qubits_data):
+                tqf.cnot(qdev, wires=[i, (i + 1) % n_qubits_data])
+            if use_strided_cnot and n_qubits_data >= 4:
+                for i in range(n_qubits_data):
+                    tqf.cnot(qdev, wires=[i, (i + 2) % n_qubits_data])
+            if reupload_data and (l < active_layers - 1):
+                for i in range(n_qubits_data):
+                    tqf.rz(qdev, wires=i, params=sub_da[:, i])
 
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         # x: [B, C, H, W] -> need to treat each pixel as a token or channel-wise?
@@ -587,6 +979,11 @@ class QuantumConv2d(nn.Module):
         self.patch_dim = in_channels * kernel_size * kernel_size
         self.q_dim = 2 ** self.n_qubits
         
+        # Input Scaling
+        self.inp_scale = nn.Parameter(torch.ones(self.patch_dim))
+        # Trainable Measurement
+        self.meas_w = nn.Parameter(0.1 * torch.randn(n_qubits, 3))
+        
         # Project patch to quantum dim
         self.in_proj = nn.Linear(self.patch_dim, self.q_dim)
         
@@ -606,6 +1003,9 @@ class QuantumConv2d(nn.Module):
         
         # Transpose to [B*L, patch_dim] for batch processing
         patches_flat = patches.transpose(1, 2).reshape(-1, self.patch_dim)
+        
+        # Apply Input Scale
+        patches_flat = patches_flat * self.inp_scale
         
         # 2. Map to Quantum Dim
         x_q = self.in_proj(patches_flat)
@@ -637,6 +1037,10 @@ class QuantumConv2d(nn.Module):
                 tqf.cnot(qdev, wires=[i, i + 1])
             for i in range(self.n_qubits):
                 tqf.ry(qdev, wires=i, params=ent_ry_params[i])
+        
+        # Trainable Measurement
+        for i in range(self.n_qubits):
+            tqf.u3(qdev, wires=i, params=self.meas_w[i])
                 
         # 5. Measure
         if hasattr(qdev, 'get_states'): states_out = qdev.get_states()
@@ -667,15 +1071,62 @@ class QuantumFrontEndQCNN(nn.Module):
       - Layer-wise Training Interface
       - Classical Residual Connection
     """
+    # @torch.jit.script # TQ functional calls are not scriptable due to global dict lookups
+    def _apply_fusion_circuit(self, qdev, sub_bsz, sub_da, interaction_wires, data_wires, 
+                              mod_params, qcnn_rot_params, 
+                              n_qubits_data: int, n_qubits_ancilla: int, active_layers: int, 
+                              use_strided_cnot: bool, reupload_data: bool):
+        # 2. Encode Data (RY)
+        for i in range(n_qubits_data):
+            tqf.ry(qdev, wires=i, params=sub_da[:, i])
+        
+        # 3. Entanglement (Ancilla -> Data) with Split Control
+        for i in range(n_qubits_data):
+            ancilla_idx = i % n_qubits_ancilla
+            ctl = interaction_wires[ancilla_idx]
+            tgt = data_wires[i]
+            # mod_params: [n_layers, n_data, 3]
+            strength = mod_params[0, i, 0].expand(sub_bsz)
+            if ancilla_idx % 2 == 0:
+                tqf.crx(qdev, wires=[ctl, tgt], params=strength)
+            else:
+                tqf.crz(qdev, wires=[ctl, tgt], params=strength)
+        
+        # 4. Spatial QCNN Backbone
+        for l in range(active_layers):
+            for i in range(n_qubits_data):
+                ry_params = qcnn_rot_params[l, i, 0, 0].expand(sub_bsz)
+                rz_params = qcnn_rot_params[l, i, 1, 0].expand(sub_bsz)
+                tqf.ry(qdev, wires=i, params=ry_params)
+                tqf.rz(qdev, wires=i, params=rz_params)
+            for i in range(n_qubits_data):
+                tqf.cnot(qdev, wires=[i, (i + 1) % n_qubits_data])
+            if use_strided_cnot and n_qubits_data >= 4:
+                for i in range(n_qubits_data):
+                    tqf.cnot(qdev, wires=[i, (i + 2) % n_qubits_data])
+            if reupload_data and (l < active_layers - 1):
+                for i in range(n_qubits_data):
+                    tqf.rz(qdev, wires=i, params=sub_da[:, i])
+
     def __init__(self, channels: int, style_dim: int, n_qubits_data: int = 6, n_qubits_ancilla: int = 2, 
                  n_layers: int = 2, freeze_qcnn: bool = False, device_name: Optional[str] = None,
                  time_emb_module: Optional[nn.Module] = None,
                  use_strided_cnot: bool = False,
                  reupload_data: bool = False,
-                 max_qdev_bsz: int = 4096):
+                 max_qdev_bsz: int = 4096,
+                 encoding_type: str = 'tanh',
+                 use_mlp_residual: bool = False,
+                 n_groups: int = 1,  # Grouped QCNN
+                 use_strong_bypass: bool = False, # Strong Classical Bypass
+                 stride: int = 2):
         super().__init__()
         self.channels = channels
         self.style_dim = style_dim
+        self.n_groups = int(n_groups)
+        self.use_strong_bypass = bool(use_strong_bypass)
+        
+        assert channels % self.n_groups == 0, f"Channels {channels} must be divisible by n_groups {n_groups}"
+        self.channels_per_group = channels // self.n_groups
         self.n_qubits_data = n_qubits_data
         
         # If integrated with QuantumMLP, we allow dimension mismatch (Adaptation via Measurement)
@@ -685,19 +1136,23 @@ class QuantumFrontEndQCNN(nn.Module):
              self.n_qubits_qmlp = 0
 
         self.n_qubits_ancilla = n_qubits_ancilla
-        self.n_wires = n_qubits_data
+        # Update total wires to include the larger of ancilla count or QMLP requirement
+        self.n_wires_ancilla = max(n_qubits_ancilla, self.n_qubits_qmlp)
+        self.n_wires = n_qubits_data + self.n_wires_ancilla
         self.n_layers = n_layers
         self.freeze_qcnn = freeze_qcnn
         self.device_name = device_name
         self.time_emb_module = time_emb_module
         self.use_strided_cnot = bool(use_strided_cnot)
         self.reupload_data = bool(reupload_data)
+        self.encoding_type = encoding_type
+        self.use_mlp_residual = use_mlp_residual
         self.eps = 1e-9
         self._printed_exec = False
         self.active_layers = n_layers # For layer-wise training
         self.max_qdev_bsz = int(max_qdev_bsz)
         self.reuse_device = True
-        self.cache_device = True
+        self.cache_device = False # Default to False to avoid graph retention issues
         self._qdev_cached = None
         self._qdev_cached_bsz = None
         self._qdev_cached_devname = None
@@ -706,54 +1161,79 @@ class QuantumFrontEndQCNN(nn.Module):
         # Assume 3x3 kernel for local context
         self.kernel_size = 3
         self.padding = 1
-        self.stride = 2
-        self.patch_dim = channels * self.kernel_size * self.kernel_size
+        self.stride = stride
+        
+        # Input Patch Dimension per Group
+        # Original: channels * k * k
+        # Grouped: (channels/groups) * k * k
+        self.patch_dim_per_group = self.channels_per_group * self.kernel_size * self.kernel_size
+        self.patch_dim = channels * self.kernel_size * self.kernel_size # Total patch dim
+        
         self.unfold = nn.Unfold(kernel_size=self.kernel_size, padding=self.padding, stride=self.stride)
         
+        # Input Scaling (per group or global? Global is easier, but per-group is more flexible)
+        # Let's keep it per patch_dim (global across groups but sliced)
+        self.inp_scale = nn.Parameter(torch.ones(self.patch_dim))
+        
         # Project Patch to Data Qubits dimension (for encoding)
-        self.data_proj = nn.Linear(self.patch_dim, n_qubits_data)
+        # We use Conv1d with kernel_size=1 to handle grouping if needed, or just reshape
+        # But here we need to map [B, groups, patch_dim_per_group] -> [B, groups, n_qubits]
+        # Or flatten groups into batch: [B*groups, patch_dim_per_group] -> [B*groups, n_qubits]
+        # This is cleaner.
+        self.data_proj = nn.Linear(self.patch_dim_per_group, n_qubits_data)
         
         self.style_proj = nn.Linear(style_dim, n_qubits_ancilla)
-        self.style_to_data = nn.Linear(style_dim, n_qubits_data)
+        self.style_to_data = nn.Linear(style_dim, n_qubits_data) # Style shared across groups for now
         
         # Refactored Parameters for Fine-grained Control and Strict Adherence to Document
         
         # 1. Ancilla Evolution Params (U_mlp): Applied to Ancilla qubits to generate |psi_time>
-        # We model this as layer-wise rotations on ancilla qubits
+        # Shared across groups
         self.ancilla_params = nn.Parameter(0.1 * torch.randn(n_layers, n_qubits_ancilla, 3))
         
         # 2. Modulation Params (Ancilla-Data Interface): CRX/CZ weights
-        # These should be TRAINABLE even when freeze_qcnn is True
-        self.mod_params = nn.Parameter(0.1 * torch.randn(n_layers, n_qubits_data, 3)) # One param per interaction pair
+        # Independent per group: [groups, layers, data, 3]
+        self.mod_params = nn.Parameter(0.1 * torch.randn(self.n_groups, n_layers, n_qubits_data, 3)) 
         
         # 3. Spatial QCNN Params (The Backbone):
-        # Includes Local Rotations (RY/RZ) and Entanglement weights (if parameterized)
-        # We separate them into two sets for clarity, but they belong to the backbone.
-        # Data Rotations
-        self.qcnn_rot_params = nn.Parameter(0.1 * torch.randn(n_layers, n_qubits_data, 2, 3)) # 2 ops (RY, RZ) per qubit
-        # Entanglement Rotations (if using parameterized entanglement or post-entanglement rotations)
-        # Assuming HEA with fixed CNOTs but maybe some rotations. 
-        # The previous code had "Stage 3" which was used for local rotations.
-        # Let's keep it simple: qcnn_rot_params covers the HEA local operations.
+        # Data Rotations - Independent per group: [groups, layers, data, 2, 3]
+        self.qcnn_rot_params = nn.Parameter(0.1 * torch.randn(self.n_groups, n_layers, n_qubits_data, 2, 3)) 
         
         if self.freeze_qcnn:
-            # Freeze QCNN Backbone (Spatial Features)
             self.qcnn_rot_params.requires_grad = False
-            # We also freeze Ancilla Evolution? The document says "Only train Time Modulation ... and Measurement Basis".
-            # This implies Ancilla Evolution (which is part of the "Generator") might also be frozen if it's considered "Backbone"?
-            # Or maybe it should be trained?
-            # "Random initialize QCNN backbone parameters... only train Time Modulation (Ancilla-Data Interface) and Measurement Basis."
-            # This strongly suggests freezing the internal evolution of both Data and Ancilla, and only training the INTERFACE.
             self.ancilla_params.requires_grad = False
         
         # Trainable Measurement Basis: Single layer of U3 rotations on Data Qubits
-        self.measure_params = nn.Parameter(0.1 * torch.randn(n_qubits_data, 3))
+        # Independent per group: [groups, data, 3]
+        self.measure_params = nn.Parameter(0.1 * torch.randn(self.n_groups, n_qubits_data, 3))
         
-        # Output Projection
-        self.out_proj = nn.Linear(n_qubits_data, channels)
+        # Output Projection (Using Probabilities: 2^N_wires -> Channels_per_group)
+        # Independent per group (via Linear since we process groups in batch)
+        self.out_proj = nn.Linear(1 << self.n_wires, self.channels_per_group)
         
         # Classical Residual
-        self.res_proj = nn.Linear(self.patch_dim, channels)
+        if self.use_mlp_residual:
+            # Hybrid Architecture: Replace linear residual with MLP
+            hidden_dim = self.patch_dim * 2
+            self.res_proj = nn.Sequential(
+                nn.Linear(self.patch_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, channels)
+            )
+        else:
+            self.res_proj = nn.Linear(self.patch_dim, channels)
+            
+        # Strong Classical Bypass (Parallel Conv Branch)
+        if self.use_strong_bypass:
+            # Must match QCNN downsampling (stride=self.stride)
+            self.strong_bypass = nn.Sequential(
+                nn.Conv2d(channels, channels, 3, padding=1, stride=self.stride), # Downsample
+                nn.GroupNorm(min(32, channels), channels),
+                nn.SiLU(),
+                nn.Conv2d(channels, channels, 3, padding=1)
+            )
+        else:
+            self.strong_bypass = None
         
         if _TQ_AVAILABLE:
             self.measure_z = tq.MeasureAll(tq.PauliZ)
@@ -784,22 +1264,223 @@ class QuantumFrontEndQCNN(nn.Module):
 
         B, C, H, W = x.shape
         
+        # 0. Strong Classical Bypass (Parallel Branch)
+        bypass_out = 0
+        if self.use_strong_bypass:
+            bypass_out = self.strong_bypass(x)
+        
         # 1. Unfold & Reshape
         patches = self.unfold(x)
         L = patches.shape[-1]
+        
+        # Flatten patches: [B, C*K*K, L] -> [B, L, C*K*K] -> [B*L, C*K*K]
         patches_flat = patches.transpose(1, 2).reshape(-1, self.patch_dim)
         
-        # 2. Build classical style parameters via QMLP (once per batch) or pass-through
-        # QMLP outputs [B, style_dim] as classical parameters; expand to pixels
-        if self.time_emb_module is not None:
-            style_base = self.time_emb_module(style)  # [B, style_dim]
+        # Apply Input Scale (Global scaling)
+        patches_flat = patches_flat * self.inp_scale
+        
+        # Grouped QCNN Reshape
+        # [B*L, channels*K*K] -> [B*L, groups, channels_per_group*K*K]
+        bsz_total = patches_flat.shape[0]
+        sub_patches = patches_flat.view(bsz_total, self.n_groups, self.patch_dim_per_group)
+        
+        # Flatten groups into batch dimension for parallel processing
+        # [B*L*groups, patch_dim_per_group]
+        sub_patches_flat = sub_patches.view(-1, self.patch_dim_per_group)
+        sub_bsz = sub_patches_flat.shape[0] # B * L * groups
+        
+        # 2. Build parameters (Classical or Quantum Injection)
+        use_fusion = (self.n_qubits_ancilla > 0) and (self.time_emb_module is not None)
+        
+        # [Optimization] Pre-compute QMLP states for Fusion Scheme
+        # This avoids re-running the same QMLP circuit for every patch (B*L times -> B times)
+        qmlp_states_expanded = None
+        if use_fusion:
+            # Assume style is [B, qmlp_qubits] (measurements) or we access qdev inside time_emb
+            # The current integration passes 'style' as the time embedding vector.
+            # If we want to fuse, we need the QUANTUM STATE of the QMLP.
+            # ... (Fusion logic remains similar, but adapted for groups)
+            pass
+
+        # Prepare Style for Grouped Processing
+        # style: [B, style_dim] -> [B*L*groups, style_dim]
+        # First expand to L: [B, L, style_dim] -> [B*L, style_dim]
+        style_expanded = style.unsqueeze(1).expand(-1, L, -1).reshape(bsz_total, -1)
+        # Then expand to groups: [B*L, 1, style_dim] -> [B*L, groups, style_dim] -> [B*L*groups, style_dim]
+        sub_style = style_expanded.unsqueeze(1).expand(-1, self.n_groups, -1).reshape(sub_bsz, -1)
+
+        # 3. Batch Processing
+        # Since we flattened groups into batch, we process everything as one huge batch
+        # BUT parameters (weights) are DIFFERENT per group.
+        # TorchQuantum doesn't support "batch-specific weights" easily in one qdev.
+        # We have two options:
+        # A) Loop over groups (slower)
+        # B) Expand parameters to match [B*L*groups] (memory intensive but parallel)
+        # We choose B for speed, utilizing broadcasting.
+        
+        # Expand Group Parameters to Batch Level
+        # mod_params: [groups, layers, data, 3] -> [B*L, groups, ...] -> [sub_bsz, ...]
+        mod_params_expanded = self.mod_params.unsqueeze(0).expand(bsz_total, -1, -1, -1, -1).reshape(sub_bsz, self.n_layers, self.n_qubits_data, 3)
+        qcnn_rot_params_expanded = self.qcnn_rot_params.unsqueeze(0).expand(bsz_total, -1, -1, -1, -1, -1).reshape(sub_bsz, self.n_layers, self.n_qubits_data, 2, 3)
+        measure_params_expanded = self.measure_params.unsqueeze(0).expand(bsz_total, -1, -1, -1).reshape(sub_bsz, self.n_qubits_data, 3)
+
+        outs = []
+        # Split large batch into chunks for qdev
+        for s in range(0, sub_bsz, self.max_qdev_bsz):
+            e = min(s + self.max_qdev_bsz, sub_bsz)
+            chunk_patches = sub_patches_flat[s:e]
+            chunk_style = sub_style[s:e]
+            chunk_mod_params = mod_params_expanded[s:e]
+            chunk_rot_params = qcnn_rot_params_expanded[s:e]
+            chunk_meas_params = measure_params_expanded[s:e]
+            
+            chunk_size = e - s
+            
+            # Data Encoding (Common)
+            if self.encoding_type == 'linear':
+                chunk_da = self.data_proj(chunk_patches.to(self.data_proj.weight.dtype))
+            else:
+                chunk_da = torch.tanh(self.data_proj(chunk_patches.to(self.data_proj.weight.dtype))) * math.pi
+            
+            # Device Init
+            qdev = tq.QuantumDevice(n_wires=self.n_wires, bsz=chunk_size, device=self.device_name)
+            
+            # ... (Circuit Application Logic - largely reused but with chunked params)
+            
+            # --- ORIGINAL SCHEME (Simplified for Grouped) ---
+            # Ancilla Init
+            # tqf.h expects single wire or list of wires for multiple H gates?
+            # It usually applies H to EACH wire in the list.
+            # The assertion error suggests matrix shape mismatch.
+            # In torchquantum functional, some gates expect list of wires, some don't.
+            # Let's use a loop to be safe.
+            for w in range(self.n_qubits_data, self.n_wires):
+                 tqf.h(qdev, wires=w)
+            
+            # Apply Circuit Layer-wise
+            chunk_sa = torch.tanh(self.style_to_data(chunk_style.to(self.style_to_data.weight.dtype))) * math.pi
+            
+            # Initial Data Encoding
+            for i in range(self.n_qubits_data):
+                tqf.ry(qdev, wires=i, params=(chunk_da[:, i] + chunk_sa[:, i]))
+                
+            for l in range(self.active_layers):
+                # 1. Local Rotations (Backbone)
+                for i in range(self.n_qubits_data):
+                    ry_p = chunk_rot_params[:, l, i, 0, 0] # [chunk_size]
+                    rz_p = chunk_rot_params[:, l, i, 1, 0]
+                    tqf.ry(qdev, wires=i, params=ry_p)
+                    tqf.rz(qdev, wires=i, params=rz_p)
+                
+                # 2. Entanglement (Backbone)
+                for i in range(self.n_qubits_data):
+                    tqf.cnot(qdev, wires=[i, (i + 1) % self.n_qubits_data])
+                if self.use_strided_cnot and self.n_qubits_data >= 4:
+                    for i in range(self.n_qubits_data):
+                        tqf.cnot(qdev, wires=[i, (i + 2) % self.n_qubits_data])
+                        
+                # 3. Data Re-uploading with Style Fusion
+                # Integrated Scheme: Re-upload both Data and Style at each layer
+                # This ensures time embedding is present throughout the deep quantum circuit
+                if self.reupload_data and (l < self.active_layers - 1):
+                    for i in range(self.n_qubits_data):
+                        # Fusion: RZ(data + style)
+                        # This is more efficient than RZ(data) followed by RX(style)
+                        tqf.rz(qdev, wires=i, params=(chunk_da[:, i] + chunk_sa[:, i]))
+                        
+                # 4. Mid-Circuit Style Injection (Deprecated in favor of Fusion above)
+                # if l < self.active_layers - 1:
+                #     for i in range(self.n_qubits_data):
+                #         tqf.rx(qdev, wires=i, params=chunk_sa[:, i])
+            
+            # Trainable Measurement Basis
+            for i in range(self.n_qubits_data):
+                tqf.u3(qdev, wires=i, params=chunk_meas_params[:, i])
+                
+            # Measurement (Probabilities)
+            if hasattr(qdev, 'get_states'): states = qdev.get_states()
+            elif hasattr(qdev, 'get_states_1d'): states = qdev.get_states_1d()
+            else: states = qdev.states
+            
+            probs = (states.abs() ** 2)
+            outs.append(probs)
+
+        # Concat chunks
+        # [sub_bsz, 2^n_wires]
+        quant_out_flat = torch.cat(outs, dim=0).to(x.device)
+        
+        # Project Output
+        # [sub_bsz, out_channels_per_group]
+        quant_proj = self.out_proj(quant_out_flat.to(self.out_proj.weight.dtype))
+        
+        # Reshape back to [B*L, groups, channels_per_group]
+        quant_grouped = quant_proj.view(bsz_total, self.n_groups, self.channels_per_group)
+        
+        # Flatten groups: [B*L, channels]
+        quant_final = quant_grouped.view(bsz_total, self.channels)
+        
+        # Classical Residual (on original flattened patches)
+        if isinstance(self.res_proj, nn.Sequential):
+            p = self.res_proj[0].weight
         else:
-            style_base = style  # [B, style_dim]
+            p = self.res_proj.weight
+            
+        res_out = self.res_proj(patches_flat.to(p.dtype))
+
+        # Combine
+        out_flat = quant_final + res_out
+        
+        # Reshape to Image
+        # Calculate output height/width
         H_out = int((H + 2 * self.padding - self.kernel_size) / self.stride + 1)
         W_out = int((W + 2 * self.padding - self.kernel_size) / self.stride + 1)
-        style_flat = style_base.view(B, 1, 1, -1).expand(B, H_out, W_out, -1).reshape(-1, self.style_dim)
+        
+        out = out_flat.reshape(B, L, self.channels).transpose(1, 2).reshape(B, self.channels, H_out, W_out)
+        
+        if self.use_strong_bypass:
+            out = out + bypass_out
+            
+        return out.to(x.device, dtype=x.dtype)
+        if use_fusion:
+             # style is [B, style_dim]. Run QMLP once per batch item.
+             # Create a temporary qdev for QMLP
+             qdev_qmlp = tq.QuantumDevice(n_wires=self.n_qubits_qmlp, bsz=B, device=x.device.type)
+             # Apply circuit (assume wires 0..n_qmlp-1)
+             self.time_emb_module.apply_circuit(qdev_qmlp, wires=list(range(self.n_qubits_qmlp)), inputs=style)
+             # Get states: [B, 2^n_qmlp]
+             if hasattr(qdev_qmlp, 'get_states_1d'): states_ancilla = qdev_qmlp.get_states_1d()
+             else: states_ancilla = qdev_qmlp.states
+             
+             # Expand to [B*L, 2^n_qmlp]
+             H_out = int((H + 2 * self.padding - self.kernel_size) / self.stride + 1)
+             W_out = int((W + 2 * self.padding - self.kernel_size) / self.stride + 1)
+             L_patches = H_out * W_out
+             # Use repeat_interleave to broadcast: [S1, S2, ...] -> [S1, S1, ..., S2, S2, ...]
+             # This matches patches_flat which is [P1_1, P1_2... P2_1...]
+             qmlp_states_expanded = states_ancilla.repeat_interleave(L_patches, dim=0)
+             # Free memory
+             del qdev_qmlp
+
+        if use_fusion:
+            # Fusion Scheme: style is raw input (e.g. sigma)
+            # Expand raw style to match spatial dimensions [B, style_dim] -> [B*L, style_dim]
+            # Note: style_dim must match QMLP input dim
+            # NOTE: sub_style is used in the loop. Even with optimization, we keep this structure for compatibility
+            # if we fall back to per-patch circuit. But with state injection, we might skip sub_style usage for QMLP.
+            H_out = int((H + 2 * self.padding - self.kernel_size) / self.stride + 1)
+            W_out = int((W + 2 * self.padding - self.kernel_size) / self.stride + 1)
+            style_flat = style.view(B, 1, 1, -1).expand(B, H_out, W_out, -1).reshape(-1, self.style_dim)
+        else:
+            # Original Scheme: style is processed to classical params
+            if self.time_emb_module is not None:
+                style_base = self.time_emb_module(style)  # [B, style_dim_out]
+            else:
+                style_base = style  # [B, style_dim]
+            H_out = int((H + 2 * self.padding - self.kernel_size) / self.stride + 1)
+            W_out = int((W + 2 * self.padding - self.kernel_size) / self.stride + 1)
+            style_flat = style_base.view(B, 1, 1, -1).expand(B, H_out, W_out, -1).reshape(-1, self.style_dim)
+
         bsz = patches_flat.shape[0]
-        dev = x.device
         device_name = self.device_name or x.device.type
         step_dyn = B * L
         step = bsz if self.max_qdev_bsz <= 0 else min(step_dyn, self.max_qdev_bsz)
@@ -809,38 +1490,99 @@ class QuantumFrontEndQCNN(nn.Module):
             end = min(start + step, bsz)
             sub_patches = patches_flat[start:end]
             sub_style   = style_flat[start:end]
-            sub_da = torch.tanh(self.data_proj(sub_patches.to(self.data_proj.weight.dtype))) * math.pi
-            sub_sa = torch.tanh(self.style_to_data(sub_style.to(self.style_to_data.weight.dtype))) * math.pi
             sub_bsz = end - start
-            if self.reuse_device and self.cache_device and self._qdev_cached is not None and self._qdev_cached_bsz == sub_bsz and self._qdev_cached_devname == device_name:
-                qdev = self._qdev_cached
+            
+            # Data Encoding (Common)
+            if self.encoding_type == 'linear':
+                # Linear encoding: direct mapping without tanh limit, scaled by pi/2 or just pi
+                # Using pi as scale to cover rotation range
+                sub_da = self.data_proj(sub_patches.to(self.data_proj.weight.dtype))
             else:
-                qdev = tq.QuantumDevice(n_wires=self.n_qubits_data, bsz=sub_bsz, device=device_name)
-                if self.cache_device:
-                    self._qdev_cached = qdev
-                    self._qdev_cached_bsz = sub_bsz
-                    self._qdev_cached_devname = device_name
-            for i in range(self.n_qubits_data):
-                tqf.ry(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
-            for l in range(self.active_layers):
+                # Tanh encoding (default)
+                sub_da = torch.tanh(self.data_proj(sub_patches.to(self.data_proj.weight.dtype))) * math.pi
+            
+            # Device Init
+            if self.reuse_device and self.cache_device and self._qdev_cached is not None and self._qdev_cached_bsz == sub_bsz and self._qdev_cached_devname == device_name:
+                 qdev = self._qdev_cached
+                 # Important: For Fusion optimization, we are setting states directly.
+                 # If reusing device, we must ensure previous states are cleared or overwritten.
+                 # set_states overwrites, so it's safe.
+            else:
+                 qdev = tq.QuantumDevice(n_wires=self.n_wires, bsz=sub_bsz, device=device_name)
+                 if self.cache_device:
+                     self._qdev_cached = qdev
+                     self._qdev_cached_bsz = sub_bsz
+                     self._qdev_cached_devname = device_name
+            
+            if use_fusion:
+                # --- FUSION SCHEME (OPTIMIZED) ---
+                data_wires = list(range(self.n_qubits_data))
+                qmlp_wires = list(range(self.n_qubits_data, self.n_qubits_data + self.n_qubits_qmlp))
+                interaction_wires = qmlp_wires[:self.n_qubits_ancilla]
+                
+                # 1. State Injection (Broadcasting Optimization)
+                sub_anc_states = qmlp_states_expanded[start:end] # [sub_bsz, 2^n_qmlp]
+                zero_state_data = torch.zeros(sub_bsz, 1 << self.n_qubits_data, dtype=sub_anc_states.dtype, device=sub_anc_states.device)
+                zero_state_data[:, 0] = 1.0
+                full_states = (zero_state_data[:, :, None] * sub_anc_states[:, None, :]).reshape(sub_bsz, -1)
+                
+                if hasattr(qdev, 'set_states'): qdev.set_states(full_states)
+                elif hasattr(qdev, 'set_states_1d'): qdev.set_states_1d(full_states)
+                else: qdev.states = full_states
+                
+                # Apply Circuit (extracted for JIT potential)
+                # We can compile this call if PyTorch supports it on `self`.
+                # To enable compilation, we can wrap this in a static function or use `self._apply_fusion_circuit`.
+                # For now, we call it directly.
+                self._apply_fusion_circuit(qdev, sub_bsz, sub_da, interaction_wires, data_wires,
+                                           chunk_mod_params, chunk_rot_params, # Pass chunked params!
+                                           self.n_qubits_data, self.n_qubits_ancilla, self.active_layers,
+                                           self.use_strided_cnot, self.reupload_data)
+
+            else:
+                # --- ORIGINAL SCHEME ---
+                sub_sa = torch.tanh(self.style_to_data(sub_style.to(self.style_to_data.weight.dtype))) * math.pi
                 for i in range(self.n_qubits_data):
-                    ry_params = self.qcnn_rot_params[l, i, 0, 0].unsqueeze(0).expand(sub_bsz)
-                    rz_params = self.qcnn_rot_params[l, i, 1, 0].unsqueeze(0).expand(sub_bsz)
-                    tqf.ry(qdev, wires=i, params=ry_params)
-                    tqf.rz(qdev, wires=i, params=rz_params)
-                for i in range(self.n_qubits_data):
-                    tqf.cnot(qdev, wires=[i, (i + 1) % self.n_qubits_data])
-                if self.use_strided_cnot and self.n_qubits_data >= 4:
+                    tqf.ry(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
+                for l in range(self.active_layers):
                     for i in range(self.n_qubits_data):
-                        tqf.cnot(qdev, wires=[i, (i + 2) % self.n_qubits_data])
+                        ry_params = self.qcnn_rot_params[l, i, 0, 0].unsqueeze(0).expand(sub_bsz)
+                        rz_params = self.qcnn_rot_params[l, i, 1, 0].unsqueeze(0).expand(sub_bsz)
+                        tqf.ry(qdev, wires=i, params=ry_params)
+                        tqf.rz(qdev, wires=i, params=rz_params)
+                    for i in range(self.n_qubits_data):
+                        tqf.cnot(qdev, wires=[i, (i + 1) % self.n_qubits_data])
+                    if self.use_strided_cnot and self.n_qubits_data >= 4:
+                        for i in range(self.n_qubits_data):
+                            tqf.cnot(qdev, wires=[i, (i + 2) % self.n_qubits_data])
+                    # 3. Data Re-uploading (Original)
                 if self.reupload_data and (l < self.active_layers - 1):
                     for i in range(self.n_qubits_data):
                         tqf.rz(qdev, wires=i, params=sub_da[:, i])
-            meas_expanded_all = self.measure_params.unsqueeze(0).expand(sub_bsz, -1, -1)
+
+                # 4. Mid-Circuit Style Injection (NEW)
+                # Inject style information coherently in the middle layers
+                if l < self.active_layers - 1:
+                     for i in range(self.n_qubits_data):
+                         # Use RX for style to be orthogonal to RZ (data re-upload) and RY (ansatz)
+                         tqf.rx(qdev, wires=i, params=sub_sa[:, i])
+            
+            # Trainable Measurement (U3) on probabilities? No, U3 must be before measurement.
+            # Re-adding Trainable Measurement (U3)
+            # Apply to ALL wires because we measure all wires (or subset if fusion)
+            # But self.measure_params is shape [n_data, 3].
+            # So we only apply to data wires.
             for i in range(self.n_qubits_data):
-                tqf.u3(qdev, wires=i, params=meas_expanded_all[:, i])
-            all_expvals = self.measure_z(qdev)
-            outs.append(all_expvals[:, :self.n_qubits_data])
+                tqf.u3(qdev, wires=i, params=self.measure_params.unsqueeze(0).expand(sub_bsz, -1, -1)[:, i])
+                
+            # Measurement (Probabilities)
+            if hasattr(qdev, 'get_states'): states = qdev.get_states()
+            elif hasattr(qdev, 'get_states_1d'): states = qdev.get_states_1d()
+            else: states = qdev.states
+            
+            # states: [sub_bsz, 2^n_wires]
+            probs = (states.abs() ** 2)
+            outs.append(probs)
             start = end
         quant_out = torch.cat(outs, dim=0)
         
@@ -853,7 +1595,10 @@ class QuantumFrontEndQCNN(nn.Module):
             e = min(s + step, bsz)
             sub_q = quant_out[s:e].to(self.out_proj.weight.device, dtype=self.out_proj.weight.dtype)
             oq.append(self.out_proj(sub_q))
-            sub_p = patches_flat[s:e].to(self.res_proj.weight.device, dtype=self.res_proj.weight.dtype)
+            
+            # Determine device/dtype from first parameter of res_proj (if Sequential)
+            res_param = next(self.res_proj.parameters())
+            sub_p = patches_flat[s:e].to(res_param.device, dtype=res_param.dtype)
             orp.append(self.res_proj(sub_p))
         out_quant = torch.cat(oq, dim=0)
         out_res = torch.cat(orp, dim=0)

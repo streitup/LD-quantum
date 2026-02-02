@@ -97,7 +97,7 @@ def parse_int_list(s):
 @click.option('--use_quantum_mlp', help='Enable QuantumMLP for time embedding.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--use_quantum_affine', help='Enable QuantumFrontEndQCNN (Quantum Affine) for spatial features.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--quantum-frontendqcnn', help='Enable QuantumFrontEndQCNN frontend (decoupled from affine).', metavar='BOOL', type=bool, default=False, show_default=True)
-@click.option('--quantum-qcnn-chunk', help='Chunk size for QCNN batched simulation (0 means no chunking).', metavar='INT', type=click.IntRange(min=0), default=1024, show_default=True)
+@click.option('--quantum-qcnn-chunk', help='Chunk size for QCNN batched simulation (0 means no chunking).', metavar='INT', type=click.IntRange(min=0), default=16384, show_default=True)
 @click.option('--quantum-qcnn-strided', help='Enable strided CNOT entanglement in QCNN.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--quantum-qcnn-reupload', help='Enable data re-uploading between QCNN layers.', metavar='BOOL', type=bool, default=False, show_default=True)
 
