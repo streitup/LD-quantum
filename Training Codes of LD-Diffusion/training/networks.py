@@ -191,7 +191,7 @@ class UNetBlock(torch.nn.Module):
         # [Quantum-Integration Marker] 保存量子集成相关参数
         self.use_quantum_transformer = use_quantum_transformer
         self.quantum_adapter = quantum_adapter
-        # self.use_quantum_affine = use_quantum_affine # Removed
+        self.use_quantum_affine = use_quantum_affine
         self.use_qcnn_frontend = use_qcnn_frontend
         self.qcnn_chunk_size = int(qcnn_chunk_size)
         self.qcnn_use_strided = bool(qcnn_use_strided)
@@ -216,7 +216,7 @@ class UNetBlock(torch.nn.Module):
             self.quantum_frontend = QuantumFrontEndQCNN(
                 channels=out_channels,
                 style_dim=emb_channels, # Raw embedding dimension
-                n_qubits_data=4,
+                n_qubits_data=2, # Optimized: 2 Qubits for Amplitude Encoding
                 n_qubits_ancilla=2,
                 n_layers=4, # Deep Architecture
                 device_name=dev_name,
@@ -226,7 +226,8 @@ class UNetBlock(torch.nn.Module):
                 n_groups=n_groups,
                 use_strong_bypass=False, # Pure Quantum as per Architecture 2
                 use_mlp_residual=False,
-                stride=1 # We rely on conv0 for resizing
+                stride=1, # We rely on conv0 for resizing
+                encoding_type='amplitude' # Use Amplitude Encoding
             )
         else:
             self.quantum_frontend = None
