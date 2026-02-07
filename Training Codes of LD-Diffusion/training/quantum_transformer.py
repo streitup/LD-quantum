@@ -59,11 +59,12 @@ class QuantumAttention64(nn.Module):
 
     def __init__(self,
                  N_QUBITS: int = 6,
-                 Q_DEPTH: int = 2,
-                 qk_dim: int = 4,
+                 Q_DEPTH: int = 4, # Optimized: Depth 4 is sufficient with MHQA
+                 qk_dim: int = 16, # Optimized: Head Dimension (16 * 4 = 64)
+                 n_heads: int = 4, # Optimized: 4 Heads
                  tau: float = 0.5,
                  tau_trainable: bool = True,
-                 attn_gate_init: float = 0.5,  # kept for API compatibility (ignored; gating via AdaLN)
+                 attn_gate_init: float = 0.5,
                  attn_dropout: float = 0.1,
                  qk_norm: str = 'layernorm',
                  force_fp32_attention: bool = True,
@@ -71,15 +72,20 @@ class QuantumAttention64(nn.Module):
         super().__init__()
         if not _TQ_AVAILABLE:
             raise ImportError("TorchQuantum 未安装或不可用：QuantumAttention64 依赖 torchquantum。请先安装 'torchquantum'.")
-        assert N_QUBITS == 6, "本实现固定使用 N_QUBITS=6（2^6=64）以匹配 64 维幅度编码。"
+        # assert N_QUBITS == 6, "本实现固定使用 N_QUBITS=6（2^6=64）以匹配 64 维幅度编码。"
+        if N_QUBITS != 6:
+            print(f"Warning: N_QUBITS={N_QUBITS} (Expected 6 for standard 64-dim amp encoding). Ensure dimensions match.")
         assert qk_norm in ('none', 'layernorm')
 
         self.N_QUBITS = int(N_QUBITS)
         self.Q_DEPTH = int(Q_DEPTH)
         self.qk_dim = int(qk_dim)
+        self.num_heads = int(n_heads)
+        self.inner_dim = self.num_heads * self.qk_dim # 64
+        
         self.force_fp32_attention = bool(force_fp32_attention)
         self.device_name = device_name
-
+        
         # Trainable PQC parameters (enc + branch-specific)
         self.enc_w = nn.Parameter(0.1 * torch.randn(self.Q_DEPTH, self.N_QUBITS, 3))
         self.q_w   = nn.Parameter(0.1 * torch.randn(self.Q_DEPTH, self.N_QUBITS, 3))
@@ -87,10 +93,16 @@ class QuantumAttention64(nn.Module):
         self.v_w   = nn.Parameter(0.1 * torch.randn(self.Q_DEPTH, self.N_QUBITS, 3))
 
         # Z measurement and q/k projections
-        self.measure_z = tq.MeasureAll(tq.PauliZ)
-        self.q_proj = nn.Linear(self.N_QUBITS, self.qk_dim)
-        self.k_proj = nn.Linear(self.N_QUBITS, self.qk_dim)
-        self.qk_ln  = nn.LayerNorm(self.qk_dim) if qk_norm == 'layernorm' else nn.Identity()
+        # Optimized: Multi-Head Projection (64 -> H*D)
+        # Multi-Basis Update: Input is 64 (Z-probs)
+        self.input_dim = 64
+        self.q_proj = nn.Linear(self.input_dim, self.inner_dim) 
+        self.k_proj = nn.Linear(self.input_dim, self.inner_dim) 
+        self.v_proj = nn.Linear(self.input_dim, self.inner_dim) 
+        self.qk_ln  = nn.LayerNorm(self.inner_dim) if qk_norm == 'layernorm' else nn.Identity()
+        
+        # Output Projection (to match standard MultiheadAttention)
+        self.out_proj = nn.Linear(self.inner_dim, 64)
 
         # Attention dropout (residual gating moved to AdaLN-Zero in the block)
         self.attn_drop = nn.Dropout(p=float(attn_dropout))
@@ -104,8 +116,12 @@ class QuantumAttention64(nn.Module):
         else:
             self.register_buffer('tau_value', torch.tensor(init_tau, dtype=torch.float32))
 
-        # Learnable Input Scaling (pre-encoding)
-        self.inp_scale = nn.Parameter(torch.ones(64))
+        # Learnable Input Scaling (pre-encoding) replaced by Full Projection
+        # This matches Classical Attention's ability to mix features before processing
+        self.inp_proj = nn.Linear(64, 64)
+        
+        # Data Re-uploading Projector (64 -> 6)
+        self.reupload_proj = nn.Linear(64, self.N_QUBITS)
 
         # Trainable Measurement Basis (U3 before measurement)
         # For Q, K (Expectation based) and V (Prob based)
@@ -118,10 +134,19 @@ class QuantumAttention64(nn.Module):
         self._printed_exec = False
 
     # --- internal helpers ---
-    def _apply_pqc(self, qdev: 'tq.QuantumDevice', weights: torch.Tensor):
-        """RX+RY -> CNOT chain -> RY with weights [depth, N_QUBITS, 3]."""
+    def _apply_pqc(self, qdev: 'tq.QuantumDevice', weights: torch.Tensor, x_reupload: Optional[torch.Tensor] = None):
+        """RX+RY -> CNOT chain -> RY with weights [depth, N_QUBITS, 3]. Supports Data Re-uploading."""
         depth = weights.shape[0]
+        # Calculate split point for re-uploading
+        reupload_idx = depth // 2
+        
         for l in range(depth):
+            # Apply Data Re-uploading at the middle
+            if x_reupload is not None and l == reupload_idx:
+                 # x_reupload shape: [bsz, N_QUBITS] (angles)
+                for i in range(self.N_QUBITS):
+                    tqf.rx(qdev, wires=i, params=x_reupload[:, i])
+                    
             rx_params = weights[l, :, 0]
             ry_params = weights[l, :, 1]
             ent_ry_params = weights[l, :, 2]
@@ -216,6 +241,16 @@ class QuantumAttention64(nn.Module):
             out = self._forward_impl(x_64, device_name)
             return out.to(x_64.device, dtype=x_64.dtype)
 
+    def _measure_multibasis(self, qdev: 'tq.QuantumDevice') -> torch.Tensor:
+        """
+        Optimized Measurement: Z-Basis Probability Distribution.
+        Reverted from Multi-Basis due to performance degradation (0.19 vs 0.07).
+        Returns: [bsz, 64]
+        """
+        # 1. Z-Basis Measurement (Standard)
+        probs_z = self._measure_probs(qdev) # [bsz, 64]
+        return probs_z
+
     def _forward_impl(self, x_64: torch.Tensor, device_name: str) -> torch.Tensor:
         # Optimized implementation: Common Encoding Fork
         # 1. Prepare common state |psi_enc> = U_enc(AmplitudeEncode(x))
@@ -223,8 +258,8 @@ class QuantumAttention64(nn.Module):
         bsz = B * S
         x_bsz = x_64.reshape(bsz, D)
         
-        # Apply Input Scaling
-        x_bsz = x_bsz * self.inp_scale
+        # Apply Input Projection (Linear Mix) before Amplitude Encoding
+        x_bsz = self.inp_proj(x_bsz)
         
         # Create common device
         qdev_common = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
@@ -241,46 +276,567 @@ class QuantumAttention64(nn.Module):
         # Prepare state for injection: [B] + [2]*N
         target_shape = [bsz] + [2] * self.N_QUBITS
         common_states_reshaped = common_states_flat.reshape(target_shape)
+        
+        # Prepare Data Re-uploading Angles (Tanh -> Pi)
+        # x_bsz: [bsz, 64] -> [bsz, 18] -> Tanh -> * Pi
+        reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
 
         # 2. Fork to Q/K/V branches
         # Q Branch
         qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
         qdev_q.states = common_states_reshaped.clone() # Direct set
-        self._apply_pqc(qdev_q, self.q_w)
+        self._apply_pqc(qdev_q, self.q_w, x_reupload=reupload_angles)
         # Trainable Measurement Basis
         for i in range(self.N_QUBITS):
-            tqf.u3(qdev_q, wires=i, params=self.meas_q_w[i])
-        z_q = self.measure_z(qdev_q)
-        q = self.qk_ln(self.q_proj(z_q)).reshape(B, S, self.qk_dim)
+            # Explicit unpacking to avoid ambiguity in tqf.u3
+            theta = self.meas_q_w[i][0]
+            phi = self.meas_q_w[i][1]
+            lam = self.meas_q_w[i][2]
+            # Must stack to create a tensor, not a list of tensors
+            tqf.u3(qdev_q, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
+        # Optimized: Measure Probs (64)
+        probs_q = self._measure_multibasis(qdev_q) # (bsz, 64)
+        
+        # Normalize and Project
+        # q_flat = F.layer_norm(probs_q, normalized_shape=(64,)) # Removed LayerNorm on probs
+        q = self.qk_ln(self.q_proj(probs_q)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3) # [B, H, S, D]
         
         # K Branch
         qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
         qdev_k.states = common_states_reshaped.clone()
-        self._apply_pqc(qdev_k, self.k_w)
+        self._apply_pqc(qdev_k, self.k_w, x_reupload=reupload_angles)
         # Trainable Measurement Basis
         for i in range(self.N_QUBITS):
-            tqf.u3(qdev_k, wires=i, params=self.meas_k_w[i])
-        z_k = self.measure_z(qdev_k)
-        k = self.qk_ln(self.k_proj(z_k)).reshape(B, S, self.qk_dim)
+            # Explicit unpacking
+            theta = self.meas_k_w[i][0]
+            phi = self.meas_k_w[i][1]
+            lam = self.meas_k_w[i][2]
+            tqf.u3(qdev_k, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
+        # Optimized: Measure Probs (64)
+        probs_k = self._measure_multibasis(qdev_k) # (bsz, 64)
+        
+        # Normalize and Project
+        # k_flat = F.layer_norm(probs_k, normalized_shape=(64,))
+        k = self.qk_ln(self.k_proj(probs_k)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3) # [B, H, S, D]
         
         # V Branch
         qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
         qdev_v.states = common_states_reshaped.clone()
-        self._apply_pqc(qdev_v, self.v_w)
+        self._apply_pqc(qdev_v, self.v_w, x_reupload=reupload_angles)
         # Trainable Measurement Basis
         for i in range(self.N_QUBITS):
-            tqf.u3(qdev_v, wires=i, params=self.meas_v_w[i])
-        probs = self._measure_probs(qdev_v)
-        v = F.layer_norm(probs.reshape(B, S, D), normalized_shape=(D,))
+            # Explicit unpacking
+            theta = self.meas_v_w[i][0]
+            phi = self.meas_v_w[i][1]
+            lam = self.meas_v_w[i][2]
+            tqf.u3(qdev_v, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
+        # Optimized: Measure Probs (64)
+        probs_v = self._measure_multibasis(qdev_v)
+        
+        # Normalize and Project
+        # v_flat = F.layer_norm(probs_v, normalized_shape=(64,)) 
+        v = self.v_proj(probs_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3) # New: with proj
 
-        # RBF attention weights
-        dist_sq = torch.cdist(q, k, p=2) ** 2   # (B, S, S)
-        tau_eff = (F.softplus(self.raw_tau) + self.eps) if self.tau_trainable else (self.tau_value + self.eps)
-        alpha = torch.exp(-dist_sq / tau_eff)   # (B, S, S)
-        alpha = alpha / (alpha.sum(dim=-1, keepdim=True) + self.eps)
-        attn_out = torch.einsum('bsj,bjd->bsd', alpha, v)  # (B,S,64)
-        attn_out = self.attn_drop(attn_out)
+
+        # Dot-Product Attention (Standard Transformer)
+        # q, k: [B, H, S, D]
+        # score: [B, H, S, S]
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.qk_dim)
+        
+        # Softmax normalization
+        alpha = torch.softmax(attn_score, dim=-1)
+        alpha = self.attn_drop(alpha) # Apply dropout to probabilities
+        
+        # Weighted sum: [B,H,S,S] @ [B,H,S,D] -> [B,H,S,D]
+        attn_out = torch.matmul(alpha, v)
+        
+        # Concat heads: [B,H,S,D] -> [B,S,H,D] -> [B,S,H*D]
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, self.inner_dim)
+        
+        # Output Projection
+        attn_out = self.out_proj(attn_out)
+        
+        # Debug Prints
+        if not self._printed_exec:
+            self._printed_exec = True
+            print(f"\n[QuantumAttention64] Debug Exec (Optimized Z-Only + Rx-Reupload):")
+            print(f"  Input Shape: {x_64.shape}")
+            print(f"  Probs Q Shape: {probs_q.shape} (Expected 64)")
+            print(f"  Output Shape: {attn_out.shape}")
+            print(f"  Param Count: {sum(p.numel() for p in self.parameters())}")
+        
         return attn_out
+
+
+class QuantumAttentionAngle(QuantumAttention64):
+    """
+    Angle Encoding (Tanh) version of Quantum Attention.
+    Replaces Amplitude Encoding with Rx/Ry rotations driven by Tanh-scaled inputs.
+    Features:
+    - Input Projection: 64 -> N_QUBITS * 2 (Rx, Ry params)
+    - Encoding: Rx(tanh(x)*pi), Ry(tanh(x)*pi)
+    - No Amplitude Encoding (starts from |0>)
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Projector for Angle Encoding (64 -> 12 for 6 qubits Rx+Ry)
+        # Optimized: MLP Projection for richer encoding
+        self.angle_proj = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, self.N_QUBITS * 2)
+        )
+        # Re-initialize to ensure fresh weights (last layer)
+        nn.init.xavier_uniform_(self.angle_proj[-1].weight)
+        nn.init.zeros_(self.angle_proj[-1].bias)
+        
+        # Residual Classical Projections (Hybrid-Residual Architecture)
+        # Allows the model to default to Classical Attention performance if Quantum is noisy
+        # q = Q_Quantum(x) + Q_Classical(x)
+        self.q_res_proj = nn.Linear(64, self.inner_dim)
+        self.k_res_proj = nn.Linear(64, self.inner_dim)
+        self.v_res_proj = nn.Linear(64, self.inner_dim)
+
+        # Learnable Head-wise Temperature (Scale)
+        # Initialize to 1/sqrt(qk_dim)
+        self.attn_scale = nn.Parameter(torch.full((self.num_heads, 1, 1), self.qk_dim ** -0.5))
+
+    def _forward_impl(self, x_64: torch.Tensor, device_name: str) -> torch.Tensor:
+        # 1. Prepare common state via Angle Encoding (No Amplitude Encoding)
+        B, S, D = x_64.shape
+        bsz = B * S
+        x_bsz = x_64.reshape(bsz, D)
+        
+        # Apply Input Projection
+        x_bsz = self.inp_proj(x_bsz)
+        
+        # Calculate Classical Residuals
+        # x_bsz is [bsz, 64], i.e. [B*S, 64]
+        q_res = self.q_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        k_res = self.k_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        v_res = self.v_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # Angle Encoding: 64 -> 12 -> Tanh -> Pi
+        # Shifted Mapping: [-1, 1] -> [0, pi]
+        raw_out = self.angle_proj(x_bsz)
+        angles = (torch.tanh(raw_out) + 1.0) * (torch.pi / 2.0)
+        
+        rx_angles = angles[:, :self.N_QUBITS]
+        ry_angles = angles[:, self.N_QUBITS:]
+
+        # Create common device (starts at |0>)
+        qdev_common = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        
+        # Apply Angle Encoding
+        for i in range(self.N_QUBITS):
+            tqf.rx(qdev_common, wires=i, params=rx_angles[:, i])
+            tqf.ry(qdev_common, wires=i, params=ry_angles[:, i])
+            
+        # Apply Common PQC
+        self._apply_pqc(qdev_common, self.enc_w)
+        
+        # Get common state (Flattened)
+        if hasattr(qdev_common, 'get_states_1d'): 
+            common_states_flat = qdev_common.get_states_1d()
+        else: 
+            common_states_flat = qdev_common.states.reshape(bsz, -1)
+        
+        # Prepare state for injection
+        target_shape = [bsz] + [2] * self.N_QUBITS
+        common_states_reshaped = common_states_flat.reshape(target_shape)
+        
+        # Data Re-uploading for branches
+        # For consistency with QuantumAttention64, we reuse the reupload_proj (64->6) logic
+        reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
+
+        # 2. Fork to Q/K/V branches (Same logic as Parent, just different start state)
+        # Q Branch
+        qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_q.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_q, self.q_w, x_reupload=reupload_angles)
+        for i in range(self.N_QUBITS):
+            tqf.u3(qdev_q, wires=i, params=self.meas_q_w[i].unsqueeze(0))
+        probs_q = self._measure_multibasis(qdev_q)
+        q = self.qk_ln(self.q_proj(probs_q)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        # Apply Residual
+        q = q + q_res
+        
+        # K Branch
+        qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_k.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_k, self.k_w, x_reupload=reupload_angles)
+        for i in range(self.N_QUBITS):
+            tqf.u3(qdev_k, wires=i, params=self.meas_k_w[i].unsqueeze(0))
+        probs_k = self._measure_multibasis(qdev_k)
+        k = self.qk_ln(self.k_proj(probs_k)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        # Apply Residual
+        k = k + k_res
+        
+        # V Branch
+        qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_v.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_v, self.v_w, x_reupload=reupload_angles)
+        for i in range(self.N_QUBITS):
+            tqf.u3(qdev_v, wires=i, params=self.meas_v_w[i].unsqueeze(0))
+        probs_v = self._measure_probs(qdev_v)
+        v = self.v_proj(probs_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        # Apply Residual
+        v = v + v_res
+
+        # 3. Attention
+        # Optimized: Use Learnable Head-wise Scale
+        # attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.attn_scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x_out = (attn @ v).transpose(1, 2).reshape(B, S, self.inner_dim)
+        x_out = self.out_proj(x_out)
+        
+        # Debug Prints
+        if not self._printed_exec:
+            self._printed_exec = True
+            print(f"\n[QuantumAttentionAngle] Debug Exec (Angle Encoding Rx+Ry):")
+            print(f"  Input Shape: {x_64.shape}")
+            print(f"  Probs Q Shape: {probs_q.shape}")
+            print(f"  Output Shape: {x_out.shape}")
+            print(f"  Learnable Scale Mean: {self.attn_scale.mean().item():.4f}")
+        
+        return x_out
+
+
+class QuantumAttentionPatch(nn.Module):
+    """
+    Patch-based Grouped Quantum Attention.
+    Implements: Patching -> Grouped Tokenization -> Quantum PQC for Q/K/V -> Classical Attention -> Patch Merging.
+    """
+    def __init__(self, dim, num_heads=4, q_depth=2, n_qubits=6, patch_size=2, device_name='cuda'):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.patch_size = patch_size
+        self.n_qubits = n_qubits
+        self.q_dim = 2 ** n_qubits # 64
+        self.device_name = device_name
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # 1. Patch Embedding & Group Projection
+        # Input: [B, S, D] -> Reshape [B, S/P, P*D] -> Project to [B, S/P, Q_DIM]
+        # Assumes S is divisible by patch_size (P)
+        self.group_dim = patch_size * dim
+        # Single linear layer to map group to quantum dimension (User request: "只需要一个线性层")
+        self.patch_proj = nn.Linear(self.group_dim, self.q_dim)
+        
+        # 2. Quantum Circuits for Q/K/V
+        # Using simple Angle Encoding (Rx) + Basic Entanglement + Measurement
+        # We share the encoding part, but have separate variational weights for Q/K/V
+        self.enc_w = nn.Parameter(torch.randn(q_depth, n_qubits))
+        self.q_w = nn.Parameter(torch.randn(q_depth, n_qubits))
+        self.k_w = nn.Parameter(torch.randn(q_depth, n_qubits))
+        self.v_w = nn.Parameter(torch.randn(q_depth, n_qubits))
+        
+        # 3. Output Projection
+        # Quantum Output (64) -> Original Group Dimension -> Reshape back
+        self.out_proj = nn.Linear(self.q_dim, self.group_dim)
+        
+        self._printed_exec = False
+
+    def _apply_pqc(self, qdev, weights):
+        # Simple PQC: Ry rotations + CNOT ring
+        # weights: [depth, n_qubits]
+        for d in range(weights.shape[0]):
+            for i in range(self.n_qubits):
+                tqf.ry(qdev, wires=i, params=weights[d][i].unsqueeze(0).repeat(qdev.bsz))
+            # Ring CNOT
+            for i in range(self.n_qubits):
+                tqf.cnot(qdev, wires=[i, (i + 1) % self.n_qubits])
+
+    def forward(self, x):
+        # x: [B, S, D]
+        B, S, D = x.shape
+        P = self.patch_size
+        assert S % P == 0, f"Sequence length {S} must be divisible by patch size {P}"
+        num_patches = S // P
+        
+        # 1. Patching & Projection
+        # [B, S, D] -> [B, S/P, P, D] -> [B, S/P, P*D]
+        x_patched = x.reshape(B, num_patches, P * D)
+        # Project to Quantum Dim (64)
+        x_q_in = torch.tanh(self.patch_proj(x_patched)) * torch.pi # Scale to [-pi, pi] for angle encoding
+        
+        bsz_q = B * num_patches
+        x_q_flat = x_q_in.reshape(bsz_q, self.q_dim)
+        
+        # 2. Quantum Execution
+        # We process Q, K, V in one go or separate devices. 
+        # For efficiency, let's use one device per branch.
+        
+        # Common Device Init
+        qdev = tq.QuantumDevice(n_wires=self.n_qubits, bsz=bsz_q, device=self.device_name)
+        
+        # Encoding (Rx) - Angle Encoding
+        # Since input is 64-dim and we have 6 qubits, we can't map 1-to-1 easily if we want 6 rotations.
+        # But wait, 6 qubits = 6 rotations. x_q_in is 64 dim.
+        # We need to map 64 -> 6 for rotation parameters.
+        # To strictly follow "minimal parameters", let's assume we slice or average, 
+        # OR we just project to 6 in the first place?
+        # User said: "只需要一个线性层将分组的特征图块进行维度映射"
+        # So patch_proj should map to n_qubits (6) or n_qubits*depth?
+        # Let's map to n_qubits for simple encoding.
+        # RE-DEFINITION: patch_proj maps to n_qubits (6)
+        
+        # Correcting logic based on "minimal params":
+        # self.patch_proj should be Linear(group_dim, n_qubits)
+        # But wait, Q/K/V usually need high dim features. 6 dims is too small for attention key?
+        # Let's stick to the user's "Quantum Attention Calculation". 
+        # Usually Q-Attention replaces the matrix multiplication. 
+        # But here user says "进行qkv线路的测量，最后进行经典的注意力机制的计算".
+        # This implies Quantum is used to GENERATE Q, K, V vectors.
+        # So: Input -> Quantum Circuit -> Measure -> Q, K, V vectors -> Classical Attention (Softmax...)
+        
+        # Re-adjusting Projection:
+        # We need enough capacity. Let's map to n_qubits (6) for encoding angles.
+        pass # Placeholder for the re-init in __init__
+
+class QuantumAttentionPatch(nn.Module):
+    """
+    Patch-based Grouped Quantum Attention (Refined).
+    Features:
+    1. Amplitude Encoding (State Preparation).
+    2. Data Re-uploading (In PQC).
+    3. Multi-head Quantum Attention.
+    """
+    def __init__(self, dim, num_heads=4, q_depth=2, n_qubits=7, patch_size=2, device_name='cuda', lora_rank=8):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.patch_size = patch_size
+        self.n_qubits = n_qubits
+        self.device_name = device_name
+        self.head_dim = dim // num_heads
+        self.scale = nn.Parameter(torch.tensor(self.head_dim ** -0.5)) # Learnable scale
+        
+        self.group_dim = patch_size * dim
+        
+        # Ensure n_qubits is sufficient for amplitude encoding
+        # We need 2^n_qubits >= group_dim to encode group_dim amplitudes
+        target_dim = 2 ** self.n_qubits
+        assert target_dim >= self.group_dim, \
+            f"n_qubits={self.n_qubits} (dim={target_dim}) insufficient for group_dim={self.group_dim}"
+        
+        # 1. Data Re-uploading Projection
+        # Maps patch features to rotation angles for re-uploading in PQC
+        # We use 3 params per qubit (U3 gate) for maximum expressivity
+        self.reupload_proj = nn.Linear(self.group_dim, n_qubits * 3)
+        
+        # 2. Variational Circuits (Weights for U3 gates: theta, phi, lam)
+        # Shape: [q_depth, n_qubits, 3]
+        self.enc_w = nn.Parameter(torch.randn(q_depth, n_qubits, 3))
+        self.q_w = nn.Parameter(torch.randn(q_depth, n_qubits, 3))
+        self.k_w = nn.Parameter(torch.randn(q_depth, n_qubits, 3))
+        self.v_w = nn.Parameter(torch.randn(q_depth, n_qubits, 3))
+        
+        # 3. Trainable Measurement Basis
+        self.meas_w = nn.Parameter(torch.randn(n_qubits, 3))
+        
+        # 4. Measurement Projection
+        # Measure expectations (n_qubits) -> group_dim -> reshape
+        self.q_out = nn.Linear(n_qubits, self.group_dim)
+        self.k_out = nn.Linear(n_qubits, self.group_dim)
+        self.v_out = nn.Linear(n_qubits, self.group_dim)
+        
+        # 5. Hybrid Classical Projections (Residuals)
+        # Replaced with Low-Rank Adapters (LoRA) for parameter efficiency
+        # Rank=lora_rank reduces params. If lora_rank <= 0, disable classical residuals.
+        self.use_classical_residual = lora_rank > 0
+        if self.use_classical_residual:
+            self.q_classical = nn.Sequential(
+                nn.Linear(self.group_dim, lora_rank, bias=False),
+                nn.Linear(lora_rank, self.group_dim, bias=False)
+            )
+            self.k_classical = nn.Sequential(
+                nn.Linear(self.group_dim, lora_rank, bias=False),
+                nn.Linear(lora_rank, self.group_dim, bias=False)
+            )
+            self.v_classical = nn.Sequential(
+                nn.Linear(self.group_dim, lora_rank, bias=False),
+                nn.Linear(lora_rank, self.group_dim, bias=False)
+            )
+        else:
+            self.q_classical = None
+            self.k_classical = None
+            self.v_classical = None
+        
+        self.out_proj = nn.Linear(dim, dim)
+        self._printed_exec = False
+
+    def _apply_pqc(self, qdev, weights, x_reupload):
+        # weights: [q_depth, n_qubits, 3] OR [B, q_depth, n_qubits, 3]
+        # x_reupload: [bsz, n_qubits * 3]
+        
+        bsz = qdev.bsz
+        # Reshape reupload for easier indexing: [bsz, n_qubits, 3]
+        x_reup = x_reupload.reshape(bsz, self.n_qubits, 3)
+        
+        # Determine depth based on weights shape
+        if weights.dim() == 4:
+            depth = weights.shape[1]
+        else:
+            depth = weights.shape[0]
+            
+        for d in range(depth):
+            # 1. Trainable Layer (U3)
+            for i in range(self.n_qubits):
+                # Expand weights to batch
+                # If weights have batch dim (for parallel branches), use them directly
+                if weights.dim() == 4: # [B, q_depth, n_qubits, 3]
+                     params = weights[:, d, i, :] # [B, 3]
+                else:
+                     params = weights[d][i].unsqueeze(0).repeat(bsz, 1)
+                
+                # Explicit unpacking to avoid ambiguity in tqf.u3
+                theta = params[:, 0]
+                phi = params[:, 1]
+                lam = params[:, 2]
+                # Pass as list to ensure unpacking works correctly in tqf.u3
+                tqf.u3(qdev, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
+            
+            # 2. Data Re-uploading Layer (U3)
+            # Inject input information into the circuit
+            for i in range(self.n_qubits):
+                params = x_reup[:, i, :]
+                theta = params[:, 0]
+            phi = params[:, 1]
+            lam = params[:, 2]
+            tqf.u3(qdev, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
+                
+            # 3. Entanglement (CNOT Ring)
+            for i in range(self.n_qubits):
+                tqf.cnot(qdev, wires=[i, (i + 1) % self.n_qubits])
+
+    def _get_expectations(self, qdev):
+        # Trainable Measurement Basis
+        bsz = qdev.bsz
+        for i in range(self.n_qubits):
+             params = self.meas_w[i].unsqueeze(0).repeat(bsz, 1)
+             theta = params[:, 0]
+             phi = params[:, 1]
+             lam = params[:, 2]
+             tqf.u3(qdev, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
+
+        # Calculate PauliZ expectation for each qubit
+        meas = tq.MeasureAll(tq.PauliZ)
+        return meas(qdev)
+
+    def forward(self, x):
+        B, S, D = x.shape
+        P = self.patch_size
+        num_patches = S // P
+        
+        # 1. Patching & Amplitude Encoding Prep
+        # [B, S, D] -> [B, num_patches, P*D]
+        x_patched = x.reshape(B, num_patches, P * D)
+        bsz_q = B * num_patches
+        
+        # Normalize for Amplitude Encoding
+        # Pad if necessary (though 128 == 2^7, so no padding needed if n_qubits=7)
+        target_dim = 2 ** self.n_qubits
+        if self.group_dim < target_dim:
+            # Zero pad
+            padding = torch.zeros(B, num_patches, target_dim - self.group_dim, device=x.device)
+            x_amp = torch.cat([x_patched, padding], dim=-1)
+        else:
+            x_amp = x_patched
+            
+        # L2 Normalize state vector
+        x_amp = F.normalize(x_amp, p=2, dim=-1)
+        x_amp_flat = x_amp.reshape(bsz_q, target_dim)
+        
+        # 2. Re-uploading Angles
+        # Map input features to rotation angles
+        reupload_angles = torch.tanh(self.reupload_proj(x_patched)) * torch.pi # [B, num_patches, n_qubits*3]
+        reupload_flat = reupload_angles.reshape(bsz_q, -1)
+        
+        # 3. Quantum Forward (Parallel Q/K/V)
+        # We process Q, K, V in a single batch to maximize GPU parallelism
+        
+        # Prepare Batch: [Q_batch, K_batch, V_batch]
+        bsz_total = 3 * bsz_q
+        
+        # Repeat states and reupload angles for 3 branches
+        x_amp_total = x_amp_flat.repeat(3, 1) # [3*bsz_q, target_dim]
+        reupload_total = reupload_flat.repeat(3, 1) # [3*bsz_q, -1]
+        
+        # Init Device for Total Batch
+        qdev = tq.QuantumDevice(n_wires=self.n_qubits, bsz=bsz_total, device=self.device_name)
+        target_shape = [bsz_total] + [2] * self.n_qubits
+        qdev.states = x_amp_total.reshape(target_shape).type(torch.complex64)
+        
+        # Prepare Weights for Parallel Execution
+        # enc_w is shared across Q, K, V -> Repeat 3 times
+        # q_w, k_w, v_w are specific -> Concatenate
+        
+        # Expand enc_w to [3*bsz_q, q_depth, n_qubits, 3]
+        enc_w_expanded = self.enc_w.unsqueeze(0).repeat(bsz_total, 1, 1, 1)
+        
+        # Construct branch weights
+        # q_w: [q_depth, n_qubits, 3] -> [bsz_q, ...]
+        q_w_expanded = self.q_w.unsqueeze(0).repeat(bsz_q, 1, 1, 1)
+        k_w_expanded = self.k_w.unsqueeze(0).repeat(bsz_q, 1, 1, 1)
+        v_w_expanded = self.v_w.unsqueeze(0).repeat(bsz_q, 1, 1, 1)
+        
+        branch_w_total = torch.cat([q_w_expanded, k_w_expanded, v_w_expanded], dim=0) # [3*bsz_q, ...]
+        
+        # Apply Shared Encoder PQC (Parallel)
+        self._apply_pqc(qdev, enc_w_expanded, reupload_total)
+        
+        # Apply Specific Branch PQC (Parallel)
+        self._apply_pqc(qdev, branch_w_total, reupload_total)
+        
+        # Measure All
+        exp_total = self._get_expectations(qdev) # [3*bsz_q, n_qubits]
+        
+        # Split Results
+        exp_q, exp_k, exp_v = torch.chunk(exp_total, 3, dim=0) # Each [bsz_q, n_qubits]
+        
+        # 4. Projection & Hybrid Residual
+        # Quantum Projection
+        q_quant = self.q_out(exp_q).reshape(B, num_patches, P*D)
+        k_quant = self.k_out(exp_k).reshape(B, num_patches, P*D)
+        v_quant = self.v_out(exp_v).reshape(B, num_patches, P*D)
+        
+        # Classical Projection (Residual)
+        if self.use_classical_residual:
+            q_class = self.q_classical(x_patched)
+            k_class = self.k_classical(x_patched)
+            v_class = self.v_classical(x_patched)
+            
+            # Combine
+            q = (q_quant + q_class).reshape(B, S, D)
+            k = (k_quant + k_class).reshape(B, S, D)
+            v = (v_quant + v_class).reshape(B, S, D)
+        else:
+            q = q_quant.reshape(B, S, D)
+            k = k_quant.reshape(B, S, D)
+            v = v_quant.reshape(B, S, D)
+        
+        # 5. Classical Multi-Head Attention
+        # Split heads
+        q = q.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        x_out = (attn @ v).transpose(1, 2).reshape(B, S, D)
+        
+        x_out = self.out_proj(x_out)
+        
+        if not self._printed_exec:
+            self._printed_exec = True
+            print(f"QuantumAttentionPatch Exec: Patches={num_patches}, Qubits={self.n_qubits} (AmpEnc+ReUpload+ParallelQKV+HybridResidual)")
+            
+        return x_out
 
 
 class ClassicAttention64(nn.Module):
@@ -340,20 +896,30 @@ class PatchEmbed2D(nn.Module):
     Assumes input latent tensor x: [B, C_in, H, W], with H=W divisible by p and C_in expected 4.
     """
 
-    def __init__(self, in_channels: int, model_dim: int, patch_size: int = 4, eps: float = 1e-9):
+    def __init__(self, in_channels: int, model_dim: int, patch_size: int = 4, eps: float = 1e-9, projection_type: str = 'linear'):
         super().__init__()
         assert patch_size > 0 and isinstance(patch_size, int)
         self.in_channels = in_channels
         self.model_dim = model_dim
         self.patch_size = patch_size
         self.eps = float(eps)
+        self.projection_type = projection_type
 
         self.conv = nn.Conv2d(in_channels, model_dim, kernel_size=patch_size, stride=patch_size)
         self.unfold = nn.Unfold(kernel_size=patch_size, stride=patch_size)
 
         # Ensure unfolded tokens map to 64-d for quantum attention.
         D_unfold = in_channels * patch_size * patch_size
-        if D_unfold == 64:
+        
+        if self.projection_type == 'mlp':
+            # MLP Projection: Linear -> SiLU -> Linear (Better compression)
+            hidden_dim = max(D_unfold, 64 * 4)
+            self.unfold_proj64 = nn.Sequential(
+                nn.Linear(D_unfold, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 64)
+            )
+        elif D_unfold == 64:
             self.unfold_proj64 = nn.Identity()
         else:
             self.unfold_proj64 = nn.Linear(D_unfold, 64)
@@ -1185,12 +1751,16 @@ class QuantumFrontEndQCNN(nn.Module):
                  use_mlp_residual: bool = False,
                  n_groups: int = 1,  # Grouped QCNN
                  use_strong_bypass: bool = False, # Strong Classical Bypass
-                 stride: int = 2):
+                 stride: int = 2,
+                 injection_mode: str = 'simple', # 'simple' or 'rich'
+                 projection_type: str = 'linear'): # 'linear', 'mlp'
         super().__init__()
         self.channels = channels
         self.style_dim = style_dim
         self.n_groups = int(n_groups)
         self.use_strong_bypass = bool(use_strong_bypass)
+        self.injection_mode = injection_mode
+        self.projection_type = projection_type
         
         assert channels % self.n_groups == 0, f"Channels {channels} must be divisible by n_groups {n_groups}"
         self.channels_per_group = channels // self.n_groups
@@ -1255,10 +1825,28 @@ class QuantumFrontEndQCNN(nn.Module):
             # For Angle Encoding, we project to the number of Rotation Gates (N)
             self.data_proj_dim = n_qubits_data
             
-        self.data_proj = nn.Linear(self.patch_dim_per_group, self.data_proj_dim)
+        if self.projection_type == 'mlp':
+            # MLP Projection: Linear -> SiLU -> Linear
+            # Increases capacity of the classical encoder
+            hidden_dim = max(self.patch_dim_per_group, self.data_proj_dim * 4)
+            self.data_proj = nn.Sequential(
+                nn.Linear(self.patch_dim_per_group, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.data_proj_dim)
+            )
+        else:
+            # Standard Linear Projection
+            self.data_proj = nn.Linear(self.patch_dim_per_group, self.data_proj_dim)
         
         self.style_proj = nn.Linear(style_dim, n_qubits_ancilla)
         self.style_to_data = nn.Linear(style_dim, n_qubits_data) # Style shared across groups for now
+        
+        if self.injection_mode == 'rich':
+            # Rich Injection: Map style to ALL rotation parameters in the QCNN backbone
+            # Target: [n_groups, n_layers, n_qubits_data, 2 (RY, RZ)]
+            # We map to flat vector and then reshape
+            self.rich_param_dim = self.n_groups * n_layers * n_qubits_data * 2
+            self.style_rich_proj = nn.Linear(style_dim, self.rich_param_dim)
         
         # Refactored Parameters for Fine-grained Control and Strict Adherence to Document
         
@@ -1393,6 +1981,34 @@ class QuantumFrontEndQCNN(nn.Module):
         qcnn_rot_params_expanded = self.qcnn_rot_params.unsqueeze(0).expand(bsz_total, -1, -1, -1, -1, -1).reshape(sub_bsz, self.n_layers, self.n_qubits_data, 2, 3)
         measure_params_expanded = self.measure_params.unsqueeze(0).expand(bsz_total, -1, -1, -1).reshape(sub_bsz, self.n_qubits_data, 3)
 
+        # [Rich Injection]
+        if self.injection_mode == 'rich':
+            # 1. Project: [B, groups*layers*qubits*2]
+            delta = self.style_rich_proj(style)
+            # 2. Reshape: [B, groups, layers, qubits, 2]
+            delta = delta.reshape(B, self.n_groups, self.n_layers, self.n_qubits_data, 2)
+            # 3. Expand L: [B, L, groups, layers, qubits, 2]
+            delta = delta.unsqueeze(1).expand(-1, L, -1, -1, -1, -1)
+            # 4. Flatten: [sub_bsz, layers, qubits, 2]
+            delta_flat = delta.reshape(sub_bsz, self.n_layers, self.n_qubits_data, 2)
+            
+            # 5. Apply to parameters (broadcast to last dim 3)
+            # qcnn_rot_params_expanded is [sub_bsz, L, N, 2, 3]
+            # We add to index [..., 0]
+            
+            # Create a zero tensor of same shape
+            # We can't do in-place modification on expanded tensor easily if it's a view.
+            # But here we just add.
+            
+            # We need to construct the adder [sub_bsz, L, N, 2, 3]
+            adder = torch.zeros_like(qcnn_rot_params_expanded)
+            # RY: delta_flat[..., 0] -> adder[..., 0, 0]
+            adder[:, :, :, 0, 0] = delta_flat[:, :, :, 0]
+            # RZ: delta_flat[..., 1] -> adder[..., 1, 0]
+            adder[:, :, :, 1, 0] = delta_flat[:, :, :, 1]
+            
+            qcnn_rot_params_expanded = qcnn_rot_params_expanded + adder
+
         # [Optimization] Reuse QuantumDevice
         # We check if we have a cached device or create a new one for the max required size
         # Ideally, we process everything in one go if sub_bsz fits in memory.
@@ -1453,14 +2069,15 @@ class QuantumFrontEndQCNN(nn.Module):
             chunk_meas_params = measure_params_expanded[s:e]
             
             # Data Encoding (Common)
+            dtype = next(self.data_proj.parameters()).dtype
             if self.encoding_type == 'linear':
-                chunk_da = self.data_proj(chunk_patches.to(self.data_proj.weight.dtype))
+                chunk_da = self.data_proj(chunk_patches.to(dtype))
             elif self.encoding_type == 'amplitude':
                 # Amplitude Encoding: Use projected features directly (Linear)
                 # They will be normalized and mapped to states below
-                chunk_da = self.data_proj(chunk_patches.to(self.data_proj.weight.dtype))
+                chunk_da = self.data_proj(chunk_patches.to(dtype))
             else:
-                chunk_da = torch.tanh(self.data_proj(chunk_patches.to(self.data_proj.weight.dtype))) * math.pi
+                chunk_da = torch.tanh(self.data_proj(chunk_patches.to(dtype))) * math.pi
             
             chunk_sa = torch.tanh(self.style_to_data(chunk_style.to(self.style_to_data.weight.dtype))) * math.pi
             
@@ -1819,6 +2436,7 @@ class QuantumTransformerDenoiser(nn.Module):
                  quantum_qk_norm: str = 'layernorm',
                  force_fp32_attention: bool = True,
                  attn_type: str = 'quantum',
+                 projection_type: str = 'linear',
                  **kwargs):
         super().__init__()
         assert pos_embed in ('none', 'sincos')
@@ -1834,9 +2452,10 @@ class QuantumTransformerDenoiser(nn.Module):
         self.dropout = float(dropout)
         self.pos_embed = pos_embed
         self.attn_type = attn_type
+        self.projection_type = projection_type
 
         # Patch embedding with dual outputs (only tokens_64 will be used)
-        self.patch_embed = PatchEmbed2D(in_channels=self.in_channels, model_dim=self.model_dim, patch_size=self.patch_size)
+        self.patch_embed = PatchEmbed2D(in_channels=self.in_channels, model_dim=self.model_dim, patch_size=self.patch_size, projection_type=self.projection_type)
 
         # Positional embeddings for quantum (64-d) tokens
         H_p = W_p = self.img_resolution // self.patch_size
@@ -1917,3 +2536,746 @@ class QuantumTransformerDenoiser(nn.Module):
         patches = patches.transpose(1, 2)          # [B, out*C*p*p, L]
         x_out = self.fold(patches)                 # [B, out, H, W]
         return x_out
+
+class LoRALayer(nn.Module):
+    """Low-Rank Adaptation Layer for Lightweight Residuals"""
+    def __init__(self, in_features, out_features, rank=4, alpha=16.0):
+        super().__init__()
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+        self.A = nn.Parameter(torch.zeros(in_features, rank))
+        self.B = nn.Parameter(torch.zeros(rank, out_features))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        nn.init.zeros_(self.B) # Initialize to 0 to start as identity/zero contribution
+
+    def forward(self, x):
+        return (x @ self.A @ self.B) * self.scaling
+
+
+class QuantumAttentionLight(QuantumAttention64):
+    """
+    Lightweight Quantum Attention:
+    1. Scaling Encoding (No MLP)
+    2. Shared Q/K/V Projection
+    3. LoRA Residuals
+    4. Enhanced Data Re-uploading
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # 1. Lightweight Encoding (Linear 64->12)
+        # Replaces complex encoding or MLP
+        self.enc_proj = nn.Linear(64, self.N_QUBITS * 2)
+        
+        # 2. Shared Measurement Projection
+        # Replace independent q/k/v projs
+        if hasattr(self, 'q_proj'): del self.q_proj
+        if hasattr(self, 'k_proj'): del self.k_proj
+        if hasattr(self, 'v_proj'): del self.v_proj
+        self.shared_proj = nn.Linear(64, self.inner_dim)
+        
+        # 3. LoRA Residuals
+        # These replace the full rank residuals
+        self.q_res_lora = LoRALayer(64, self.inner_dim, rank=4)
+        self.k_res_lora = LoRALayer(64, self.inner_dim, rank=4)
+        self.v_res_lora = LoRALayer(64, self.inner_dim, rank=4)
+        
+        # Learnable Scale
+        self.attn_scale = nn.Parameter(torch.full((self.num_heads, 1, 1), self.qk_dim ** -0.5))
+        
+        # Remove unused
+        if hasattr(self, 'inp_proj'): del self.inp_proj
+        if hasattr(self, 'reupload_proj'): del self.reupload_proj
+
+    def _forward_impl(self, x_64: torch.Tensor, device_name: str) -> torch.Tensor:
+        B, S, D = x_64.shape
+        bsz = B * S
+        x_bsz = x_64.reshape(bsz, D)
+        
+        # Encoding Angles: [BSZ, 12] -> split to [BSZ, 6] (Rx) and [BSZ, 6] (Ry)
+        # We use Tanh * pi to bound angles
+        angles = torch.tanh(self.enc_proj(x_bsz)) * torch.pi
+        
+        # Split into Rx and Ry params
+        rx_params = angles[:, :self.N_QUBITS]
+        ry_params = angles[:, self.N_QUBITS:]
+        
+        # Common State Preparation (No Amplitude Encoding, start from |0>)
+        qdev_common = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        
+        # Apply Initial Rotations (Encoding)
+        for i in range(self.N_QUBITS):
+            tqf.rx(qdev_common, wires=i, params=rx_params[:, i])
+            tqf.ry(qdev_common, wires=i, params=ry_params[:, i])
+            
+        # Apply PQC (Entanglement)
+        self._apply_pqc(qdev_common, self.enc_w)
+        
+        # Get common state
+        if hasattr(qdev_common, 'get_states_1d'): 
+            common_states_flat = qdev_common.get_states_1d()
+        else: 
+            common_states_flat = qdev_common.states.reshape(bsz, -1)
+        target_shape = [bsz] + [2] * self.N_QUBITS
+        common_states_reshaped = common_states_flat.reshape(target_shape)
+        
+        # Re-uploading angles
+        reupload_angles = rx_params
+        
+        # Branches
+        # Q Branch
+        qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_q.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_q, self.q_w, x_reupload=reupload_angles)
+        for i in range(self.N_QUBITS): tqf.u3(qdev_q, wires=i, params=self.meas_q_w[i].unsqueeze(0))
+        probs_q = self._measure_multibasis(qdev_q)
+        # Hybrid Q: Shared Proj + LoRA Residual
+        q_quant = self.shared_proj(probs_q)
+        q_res = self.q_res_lora(x_bsz)
+        q = self.qk_ln(q_quant + q_res).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # K Branch
+        qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_k.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_k, self.k_w, x_reupload=reupload_angles)
+        for i in range(self.N_QUBITS): tqf.u3(qdev_k, wires=i, params=self.meas_k_w[i].unsqueeze(0))
+        probs_k = self._measure_multibasis(qdev_k)
+        # Hybrid K
+        k_quant = self.shared_proj(probs_k)
+        k_res = self.k_res_lora(x_bsz)
+        k = self.qk_ln(k_quant + k_res).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # V Branch
+        qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_v.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_v, self.v_w, x_reupload=reupload_angles)
+        for i in range(self.N_QUBITS): tqf.u3(qdev_v, wires=i, params=self.meas_v_w[i].unsqueeze(0))
+        probs_v = self._measure_multibasis(qdev_v)
+        # Hybrid V
+        v_quant = self.shared_proj(probs_v)
+        v_res = self.v_res_lora(x_bsz)
+        v = (v_quant + v_res).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # Attention
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) * self.attn_scale
+        alpha = torch.softmax(attn_score, dim=-1)
+        alpha = self.attn_drop(alpha)
+        attn_out = torch.matmul(alpha, v)
+        
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, self.inner_dim)
+        attn_out = self.out_proj(attn_out)
+        
+        # Debug Prints
+        if not self._printed_exec:
+            self._printed_exec = True
+            print(f"\n[QuantumAttentionLight] Debug Exec:")
+            print(f"  Input Shape: {x_64.shape}")
+            print(f"  Probs Q Shape: {probs_q.shape}")
+            print(f"  Output Shape: {attn_out.shape}")
+            print(f"  Learnable Scale Mean: {self.attn_scale.mean().item():.4f}")
+        
+        return attn_out
+
+
+class QuantumAttentionDeep(QuantumAttentionAngle):
+    """
+    Deep Quantum Attention:
+    1. Increased Depth (8 layers)
+    2. Circular Entanglement (CNOTs between 0-1, 1-2, ..., N-0)
+    3. Denser Rotation Gates
+    """
+    def __init__(self, *args, **kwargs):
+        # Force depth 8 if not specified, but respect kwargs if they want more
+        if 'Q_DEPTH' not in kwargs:
+            kwargs['Q_DEPTH'] = 8
+        super().__init__(*args, **kwargs)
+
+    def _apply_pqc(self, qdev: 'tq.QuantumDevice', weights: torch.Tensor, x_reupload: Optional[torch.Tensor] = None):
+        """Deep PQC with Circular Entanglement"""
+        depth = weights.shape[0]
+        reupload_idx = depth // 2
+        
+        for l in range(depth):
+            # Re-uploading
+            if x_reupload is not None and l == reupload_idx:
+                for i in range(self.N_QUBITS):
+                    tqf.rx(qdev, wires=i, params=x_reupload[:, i])
+            
+            rx_params = weights[l, :, 0]
+            ry_params = weights[l, :, 1]
+            rz_params = weights[l, :, 2] # Use 3rd param as RZ instead of post-ent RY
+            
+            # Pre-rotations (Rx, Ry, Rz) - denser
+            for i in range(self.N_QUBITS):
+                tqf.rx(qdev, wires=i, params=rx_params[i])
+                tqf.ry(qdev, wires=i, params=ry_params[i])
+                tqf.rz(qdev, wires=i, params=rz_params[i])
+                
+            # Circular CNOT Entanglement
+            # 0->1, 1->2, ..., 5->0
+            for i in range(self.N_QUBITS):
+                tqf.cnot(qdev, wires=[i, (i + 1) % self.N_QUBITS])
+                
+            # No post-rotations in this layer block, we used 3 params already.
+            # This is a different ansatz structure than Base.
+
+
+class QuantumAttentionHybrid(QuantumAttentionAngle):
+    """
+    Hybrid Quantum Attention:
+    1. Classical Q/K Projection (Standard Linear) -> Stable Attention Map
+    2. Quantum V Projection (Angle Encoding + PQC) -> Quantum Feature Transformation
+    3. Fuses best of both worlds: Geometric stability of classical attention + High dimensional mapping of Quantum
+    """
+    def __init__(self, input_dim=64, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Classical Q and K Projections
+        # Override/Shadow the quantum ones if needed, or just define new ones
+        self.input_dim_val = int(input_dim)
+        self.q_proj_class = nn.Linear(self.input_dim_val, self.inner_dim)
+        self.k_proj_class = nn.Linear(self.input_dim_val, self.inner_dim)
+        
+        # If input_dim is not 64, we need to adapt the quantum path projections as well
+        if self.input_dim_val != 64:
+            # Re-initialize input projection for quantum path
+            self.inp_proj = nn.Linear(self.input_dim_val, 64)
+            # Re-initialize residual projections
+            self.q_res_proj = nn.Linear(self.input_dim_val, self.inner_dim)
+            self.k_res_proj = nn.Linear(self.input_dim_val, self.inner_dim)
+            self.v_res_proj = nn.Linear(self.input_dim_val, self.inner_dim)
+            # Re-uploading projector
+            self.reupload_proj = nn.Linear(self.input_dim_val, self.N_QUBITS)
+            # Angle projection
+            self.angle_proj = nn.Linear(self.input_dim_val, self.N_QUBITS * 2)
+            
+            # Re-initialize Output Projection to match input dimension
+            self.out_proj = nn.Linear(self.inner_dim, self.input_dim_val)
+
+    def _forward_impl(self, x_64: torch.Tensor, device_name: str) -> torch.Tensor:
+        B, S, D = x_64.shape
+        bsz = B * S
+        x_bsz = x_64.reshape(bsz, D)
+        
+        # 1. Classical Path for Q/K
+        # Input proj for classical path (optional, but let's use the one from super or raw)
+        # Let's use raw x_bsz or self.inp_proj(x_bsz). 
+        # super() has self.inp_proj. Let's use it for consistency.
+        # However, if input_dim != 64, inp_proj maps to 64, which is for quantum path.
+        # For classical path, we want to project from input_dim directly if possible, 
+        # or use the projected 64-dim feature?
+        # To maintain full information for classical Q/K, we should use x_bsz directly.
+        # But q_proj_class expects self.input_dim_val.
+        
+        x_proj = x_bsz # Direct input usage
+
+        q = self.qk_ln(self.q_proj_class(x_proj)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        k = self.qk_ln(self.k_proj_class(x_proj)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # Apply Residuals (Classical)
+        q_res = self.q_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        k_res = self.k_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        q = q + q_res
+        k = k + k_res
+
+        # 2. Quantum Path for V
+        # Prepare Common State (Angle Encoding)
+        # Code borrowed from QuantumAttentionAngle._forward_impl
+        raw_out = self.angle_proj(x_bsz)
+        angles = (torch.tanh(raw_out) + 1.0) * (torch.pi / 2.0)
+        rx_angles = angles[:, :self.N_QUBITS]
+        ry_angles = angles[:, self.N_QUBITS:]
+        
+        qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        
+        # Encode
+        for i in range(self.N_QUBITS):
+            tqf.rx(qdev_v, wires=i, params=rx_angles[:, i])
+            tqf.ry(qdev_v, wires=i, params=ry_angles[:, i])
+            
+        # PQC (Encoder)
+        self._apply_pqc(qdev_v, self.enc_w)
+        
+        # Re-uploading angles
+        reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
+        
+        # V PQC
+        self._apply_pqc(qdev_v, self.v_w, x_reupload=reupload_angles)
+        
+        # Measure V
+        for i in range(self.N_QUBITS):
+            tqf.u3(qdev_v, wires=i, params=self.meas_v_w[i].unsqueeze(0))
+        probs_v = self._measure_multibasis(qdev_v)
+        
+        # Project V
+        # Note: parent has self.v_proj (Linear 64->Inner)
+        # We reuse it.
+        v_quant = self.v_proj(probs_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # V Residual
+        v_res = self.v_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        v = v_quant + v_res
+        
+        # 3. Attention
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) * self.attn_scale
+        alpha = torch.softmax(attn_score, dim=-1)
+        alpha = self.attn_drop(alpha)
+        
+        attn_out = torch.matmul(alpha, v)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, self.inner_dim)
+        attn_out = self.out_proj(attn_out)
+        
+        if not self._printed_exec:
+            self._printed_exec = True
+            print(f"\n[QuantumAttentionHybridLite] Debug Exec:")
+            print(f"  Mode: Lite Classical Q/K (Groups=2) + Quantum V")
+            print(f"  Params pruned: Unused Quantum Q/K weights deleted")
+            
+        return attn_out
+        
+        # 3. Attention Mechanism
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) * self.attn_scale
+        alpha = torch.softmax(attn_score, dim=-1)
+        alpha = self.attn_drop(alpha)
+        
+        attn_out = torch.matmul(alpha, v)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, self.inner_dim)
+        attn_out = self.out_proj(attn_out)
+        
+        # Debug Prints
+        if not self._printed_exec:
+            self._printed_exec = True
+            print(f"\n[QuantumAttentionHybrid] Debug Exec:")
+            print(f"  Mode: Classical Q/K + Quantum V")
+            print(f"  V Probs Shape: {probs_v.shape}")
+            
+        return attn_out
+
+
+class QuantumAttentionHybridLite(QuantumAttentionHybrid):
+    """
+    Lite Hybrid Quantum Attention:
+    1. Removes unused Quantum Q/K parameters (Big saving).
+    2. Uses Grouped Linear (Conv1d groups=2) for Classical Q/K (Parameter saving).
+    3. Retains Quantum V for feature extraction.
+    """
+    def __init__(self, input_dim=64, *args, **kwargs):
+        super().__init__(input_dim=input_dim, *args, **kwargs)
+        
+        # 1. Delete unused Quantum Q/K parameters and projections from base class
+        # These are generated by QuantumAttentionAngle (grandparent) but not used in Hybrid
+        to_delete = ['q_w', 'k_w', 'meas_q_w', 'meas_k_w', 'q_proj', 'k_proj']
+        for name in to_delete:
+            if hasattr(self, name):
+                delattr(self, name)
+                
+        # 2. Replace Standard Classical Projections (from Hybrid) with Lite Grouped versions
+        # Hybrid created self.q_proj_class and self.k_proj_class (Linear)
+        # We replace them with Grouped Conv1d (equivalent to Grouped Linear)
+        
+        # Note: Conv1d expects [B, C, L]. We will reshape in forward.
+        # Groups=2 reduces parameters by half.
+        self.q_proj_lite = nn.Conv1d(self.input_dim_val, self.inner_dim, kernel_size=1, groups=2)
+        self.k_proj_lite = nn.Conv1d(self.input_dim_val, self.inner_dim, kernel_size=1, groups=2)
+        
+        # Delete the standard linear ones from Hybrid to save params
+        if hasattr(self, 'q_proj_class'): del self.q_proj_class
+        if hasattr(self, 'k_proj_class'): del self.k_proj_class
+        
+        # 3. Lite Residuals Optimization (SOTA V2)
+        # Removed q_res_lite and k_res_lite as they are redundant in Attention mechanism
+        # (Standard attention usually applies residuals after the block, not inside Q/K)
+        if hasattr(self, 'q_res_proj'): del self.q_res_proj
+        if hasattr(self, 'k_res_proj'): del self.k_res_proj
+        
+        # 4. Lite V Residual and Out Projection
+        # Replace Linear with Grouped Conv1d (groups=2) for parameter efficiency
+        if hasattr(self, 'v_res_proj'): del self.v_res_proj
+        if hasattr(self, 'out_proj'): del self.out_proj
+        
+        self.v_res_lite = nn.Conv1d(self.input_dim_val, self.inner_dim, kernel_size=1, groups=2)
+        self.out_proj_lite = nn.Conv1d(self.inner_dim, self.input_dim_val, kernel_size=1, groups=2)
+
+        # We keep V quantum parts as is (v_w, meas_v_w)
+        # Revert: Use Probability Measurement to preserve high-dimensional features (2^N)
+        # instead of Expectation Measurement (N).
+        # self.measure_all = tq.MeasureAll(tq.PauliZ)
+        
+        # Re-initialize v_proj to match 2**N_QUBITS output from Probability Measurement
+        self.v_proj = nn.Linear(2**self.N_QUBITS, self.inner_dim)
+        
+        # Zero-Init Output Projection to act as Identity initially (Stability)
+        nn.init.zeros_(self.out_proj_lite.weight)
+        nn.init.zeros_(self.out_proj_lite.bias)
+
+    def _forward_impl(self, x_in: torch.Tensor, device_name: str) -> torch.Tensor:
+        # x_in is [B, S, D]
+        B, S, D = x_in.shape
+        bsz = B * S
+        x_bsz = x_in.reshape(bsz, D)
+        
+        # Prepare for Conv1d: [N, C, L] -> here [BSZ, D, 1]
+        x_conv = x_bsz.unsqueeze(-1) # [BSZ, D, 1]
+        
+        # 1. Classical Path for Q/K (Lite)
+        q_raw = self.q_proj_lite(x_conv).squeeze(-1) # [BSZ, Inner]
+        k_raw = self.k_proj_lite(x_conv).squeeze(-1)
+        
+        q = self.qk_ln(q_raw).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        k = self.qk_ln(k_raw).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # Removed redundant Q/K residuals
+
+        # 2. Quantum Path for V (Same as Standard Hybrid)
+        # Use logic from Hybrid/Angle
+        # Note: Hybrid uses self.angle_proj(x_bsz) and self.reupload_proj(x_bsz)
+        # These are set up by Hybrid.__init__ using input_dim_val, so they are correct.
+        
+        raw_out = self.angle_proj(x_bsz)
+        angles = (torch.tanh(raw_out) + 1.0) * (torch.pi / 2.0)
+        rx_angles = angles[:, :self.N_QUBITS]
+        ry_angles = angles[:, self.N_QUBITS:]
+        
+        qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        for i in range(self.N_QUBITS):
+            tqf.rx(qdev_v, wires=i, params=rx_angles[:, i])
+            tqf.ry(qdev_v, wires=i, params=ry_angles[:, i])
+            
+        self._apply_pqc(qdev_v, self.enc_w)
+        reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
+        self._apply_pqc(qdev_v, self.v_w, x_reupload=reupload_angles)
+        
+        for i in range(self.N_QUBITS):
+            tqf.u3(qdev_v, wires=i, params=self.meas_v_w[i].unsqueeze(0))
+        
+        # Revert: Use Probability Measurement -> [B*S, 2^N]
+        # This preserves the high-dimensional feature space of the quantum state.
+        meas_v = self._measure_probs(qdev_v)
+        
+        v_quant = self.v_proj(meas_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # Lite V Residual
+        v_res = self.v_res_lite(x_conv).squeeze(-1).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        v = v_quant + v_res
+        
+        # 3. Attention
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) * self.attn_scale
+        alpha = torch.softmax(attn_score, dim=-1)
+        alpha = self.attn_drop(alpha)
+        
+        attn_out = torch.matmul(alpha, v)
+        # attn_out: [B, H, S, D_head] -> permute -> [B, S, H, D_head] -> reshape -> [B, S, Inner]
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, self.inner_dim)
+        
+        # Lite Out Projection (Conv1d groups=2)
+        # Input to Conv1d must be [Batch, Channels, Length]
+        # Here we treat 'S' as Batch or just reshape?
+        # Standard: [B*S, Inner, 1]
+        attn_out_bsz = attn_out.reshape(bsz, self.inner_dim).unsqueeze(-1) # [BSZ, Inner, 1]
+        attn_out = self.out_proj_lite(attn_out_bsz).squeeze(-1) # [BSZ, OutDim]
+        attn_out = attn_out.reshape(B, S, self.input_dim_val)
+        
+        if not self._printed_exec:
+            self._printed_exec = True
+            print(f"\n[QuantumAttentionHybridLite] Debug Exec:")
+            print(f"  Mode: Lite Classical Q/K/V_res/Out (Groups=2) + Quantum V")
+            print(f"  Input Dim: {D}")
+            
+        return attn_out
+
+
+class QuantumFrontEndQCNNState(QuantumFrontEndQCNN):
+    """
+    QCNN Front-End that returns the Quantum State Vector instead of measured values.
+    Used for 'No Measurement' architecture where QCNN state feeds directly into Quantum Attention.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Fix for Re-uploading in Amplitude Encoding mode
+        # We need a separate projection to generate angles for re-uploading layers
+        # because the main data_proj generates the state vector (2^N) directly.
+        if self.reupload_data and self.encoding_type == 'amplitude':
+             self.reupload_proj = nn.Linear(self.patch_dim_per_group, self.n_qubits_data)
+
+    def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        # Simplified forward based on parent class, but returns state.
+        # Assumes n_groups=1 for simplicity in this benchmark mode.
+        
+        B, C, H, W = x.shape
+        
+        # 1. Unfold & Reshape
+        patches = self.unfold(x)
+        # Flatten patches: [B, C*K*K, L] -> [B*L, C*K*K]
+        patches_flat = patches.transpose(1, 2).reshape(-1, self.patch_dim)
+        patches_flat = patches_flat * self.inp_scale
+        
+        bsz_total = patches_flat.shape[0]
+        # Reshape to groups (assuming n_groups=1 or we flatten groups into batch)
+        # [B*L, groups, patch_dim_per_group]
+        sub_patches = patches_flat.reshape(bsz_total, self.n_groups, self.patch_dim_per_group)
+        sub_patches_flat = sub_patches.reshape(-1, self.patch_dim_per_group)
+        sub_bsz = sub_patches_flat.shape[0]
+
+        # Prepare Style
+        L = patches.shape[-1]
+        style_expanded = style.unsqueeze(1).expand(-1, L, -1).reshape(bsz_total, -1)
+        sub_style = style_expanded.unsqueeze(1).expand(-1, self.n_groups, -1).reshape(sub_bsz, -1)
+        
+        # Expand Params
+        mod_params_expanded = self.mod_params.unsqueeze(0).expand(bsz_total, -1, -1, -1, -1).reshape(sub_bsz, self.n_layers, self.n_qubits_data, 3)
+        qcnn_rot_params_expanded = self.qcnn_rot_params.unsqueeze(0).expand(bsz_total, -1, -1, -1, -1, -1).reshape(sub_bsz, self.n_layers, self.n_qubits_data, 2, 3)
+        
+        # Batch Processing
+        chunk_size_limit = self.max_qdev_bsz
+        if sub_bsz <= chunk_size_limit * 2: 
+            chunk_size_limit = sub_bsz
+            
+        outs_state = []
+        
+        # Device creation
+        qdev = tq.QuantumDevice(n_wires=self.n_wires, bsz=min(sub_bsz, chunk_size_limit), device=self.device_name)
+        
+        for s in range(0, sub_bsz, chunk_size_limit):
+            e = min(s + chunk_size_limit, sub_bsz)
+            actual_chunk_size = e - s
+            
+            if actual_chunk_size != qdev.bsz:
+                qdev_chunk = tq.QuantumDevice(n_wires=self.n_wires, bsz=actual_chunk_size, device=self.device_name)
+            else:
+                qdev_chunk = qdev
+                if hasattr(qdev_chunk, 'reset_states'): qdev_chunk.reset_states(actual_chunk_size)
+            
+            chunk_patches = sub_patches_flat[s:e]
+            chunk_style = sub_style[s:e]
+            chunk_mod_params = mod_params_expanded[s:e]
+            chunk_rot_params = qcnn_rot_params_expanded[s:e]
+            
+            # Data Encoding (Linear/Amplitude)
+            dtype = next(self.data_proj.parameters()).dtype
+            chunk_da_reupload = None
+
+            if self.encoding_type == 'amplitude':
+                chunk_da = self.data_proj(chunk_patches.to(dtype))
+                # Normalize and Pad logic (Simplified from parent)
+                norm = torch.norm(chunk_da, p=2, dim=1, keepdim=True) + 1e-8
+                chunk_da_norm = chunk_da / norm
+                target_dim = 2 ** self.n_qubits_data
+                curr_dim = chunk_da_norm.shape[1]
+                if curr_dim < target_dim:
+                    padding = torch.zeros(actual_chunk_size, target_dim - curr_dim, device=chunk_da.device, dtype=chunk_da.dtype)
+                    data_state = torch.cat([chunk_da_norm, padding], dim=1)
+                else:
+                    data_state = chunk_da_norm[:, :target_dim]
+                    data_state = data_state / (torch.norm(data_state, p=2, dim=1, keepdim=True) + 1e-8)
+                
+                # Ancilla logic: Pad with |0> for ancilla qubits
+                # Assume Data on Wires 0..N_data-1, Ancilla on N_data..N_wires-1
+                n_ancilla = self.n_wires - self.n_qubits_data
+                
+                # Reshape data to [B, 2, ..., 2] (N_data times)
+                data_view = data_state.reshape([actual_chunk_size] + [2] * self.n_qubits_data)
+                data_complex = torch.complex(data_view, torch.zeros_like(data_view))
+                
+                if n_ancilla > 0:
+                    # Initialize full state with zeros
+                    full_state = torch.zeros([actual_chunk_size] + [2] * self.n_wires, dtype=torch.cfloat, device=chunk_da.device)
+                    
+                    # Assign data to the slice where ancilla are |0>
+                    # Slicing: [:, :, ..., :, 0, 0, ..., 0]
+                    # Create a tuple of slices
+                    # dim 0 is batch (slice(None))
+                    # dims 1..N_data are data (slice(None))
+                    # dims N_data+1..end are ancilla (index 0)
+                    idx = [slice(None)] * (1 + self.n_qubits_data) + [0] * n_ancilla
+                    full_state[tuple(idx)] = data_complex
+                    
+                    qdev_chunk.states = full_state
+                else:
+                    qdev_chunk.states = data_complex
+                
+                # Calculate Re-uploading Angles if enabled
+                if self.reupload_data and hasattr(self, 'reupload_proj'):
+                    chunk_da_reupload = torch.tanh(self.reupload_proj(chunk_patches.to(dtype))) * math.pi
+            else:
+                 # Angle encoding
+                 chunk_da = torch.tanh(self.data_proj(chunk_patches.to(dtype))) * math.pi
+                 chunk_da_reupload = chunk_da
+            
+            chunk_sa = torch.tanh(self.style_to_data(chunk_style.to(self.style_to_data.weight.dtype))) * math.pi
+            
+            # Apply Circuit
+            self._apply_fusion_circuit(
+                qdev_chunk, actual_chunk_size, chunk_da_reupload, 
+                chunk_sa, None, None, chunk_mod_params, chunk_rot_params,
+                self.n_qubits_data, self.n_qubits_ancilla, self.active_layers,
+                self.use_strided_cnot, self.reupload_data, self.encoding_type
+            )
+            
+            # NO MEASUREMENT - Get State
+            if hasattr(qdev_chunk, 'get_states_1d'): 
+                states = qdev_chunk.get_states_1d() # [chunk, 2^N]
+            else: 
+                states = qdev_chunk.states.reshape(actual_chunk_size, -1)
+            
+            outs_state.append(states)
+            
+        # Concat all states
+        all_states = torch.cat(outs_state, dim=0) # [B*L*groups, 2^N]
+        
+        # Reshape to [B, L, groups, 2^N] -> [B, L, 2^N] (assuming groups=1)
+        # Or just return [B, L, D_state]
+        return all_states.reshape(B, L, -1)
+
+
+class QuantumAttentionState(QuantumAttention64):
+    """
+    Quantum Attention that accepts a Quantum State Vector as input.
+    Skips encoding step.
+    """
+    def forward(self, x_state: torch.Tensor, has_cls: bool = False) -> torch.Tensor:
+        """
+        x_state: [B, S, 2^N_QUBITS] (Complex64/128)
+        """
+        dev = x_state.device
+        device_name = self.device_name or dev.type
+        
+        # We need to ensure input is complex
+        if not x_state.is_complex():
+             # Should not happen if coming from QCNNState
+             pass
+             
+        out = self._forward_impl_state(x_state, device_name)
+        return out
+
+    def _forward_impl_state(self, x_state: torch.Tensor, device_name: str) -> torch.Tensor:
+        B, S, StateDim = x_state.shape
+        bsz = B * S
+        x_flat = x_state.reshape(bsz, StateDim) # [bsz, 2^N]
+        
+        # Prepare shape for TQ [bsz, 2, 2, ...]
+        target_shape = [bsz] + [2] * self.N_QUBITS
+        common_states_reshaped = x_flat.reshape(target_shape)
+        
+        # Since we have the state, we can compute "reupload angles" from the state?
+        # No, re-upload usually requires classical data. 
+        # For this "No Measurement" mode, we might skip re-upload or use a dummy.
+        # Or we can project the state probabilities to classical to get reupload parameters?
+        # For simplicity, we SKIP re-upload or set it to zero.
+        x_reupload = None 
+        
+        # 2. Fork to Q/K/V branches (same as parent but start from state)
+        # Q Branch
+        qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_q.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_q, self.q_w, x_reupload=x_reupload)
+        for i in range(self.N_QUBITS): tqf.u3(qdev_q, wires=i, params=self.meas_q_w[i].unsqueeze(0))
+        probs_q = self._measure_multibasis(qdev_q)
+        q = self.qk_ln(self.q_proj(probs_q)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # K Branch
+        qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_k.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_k, self.k_w, x_reupload=x_reupload)
+        for i in range(self.N_QUBITS): tqf.u3(qdev_k, wires=i, params=self.meas_k_w[i].unsqueeze(0))
+        probs_k = self._measure_multibasis(qdev_k)
+        k = self.qk_ln(self.k_proj(probs_k)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # V Branch
+        qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        qdev_v.states = common_states_reshaped.clone()
+        self._apply_pqc(qdev_v, self.v_w, x_reupload=x_reupload)
+        for i in range(self.N_QUBITS): tqf.u3(qdev_v, wires=i, params=self.meas_v_w[i].unsqueeze(0))
+        probs_v = self._measure_multibasis(qdev_v)
+        v = self.v_proj(probs_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        
+        # Attention
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.qk_dim)
+        alpha = torch.softmax(attn_score, dim=-1)
+        alpha = self.attn_drop(alpha)
+        attn_out = torch.matmul(alpha, v)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, self.inner_dim)
+        attn_out = self.out_proj(attn_out)
+        
+        return attn_out
+
+
+class QuantumAdapterHybridLite(nn.Module):
+    """
+    Adapter class to wrap QuantumAttentionHybridLite for integration into UNetBlock.
+    Handles shape transformation from [B, C, H, W] to [B, S, C] and back.
+    """
+    def __init__(self, in_channels, num_heads=4, device_name='cuda', **kwargs):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_heads = num_heads
+        
+        # Calculate qk_dim based on input channels and heads
+        if in_channels % num_heads != 0:
+            qk_dim = in_channels // num_heads
+        else:
+            qk_dim = in_channels // num_heads
+            
+        self.attn = QuantumAttentionHybridLite(
+            input_dim=in_channels,
+            N_QUBITS=6,
+            qk_dim=qk_dim,
+            n_heads=num_heads,
+            device_name=device_name,
+            **kwargs
+        )
+
+    def forward(self, x: torch.Tensor, num_heads: Optional[int] = None) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x_flat = x.permute(0, 2, 3, 1).reshape(B, H*W, C)
+        out_flat = self.attn(x_flat)
+        out = out_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        return out
+
+class QuantumAdapterHybrid(nn.Module):
+    """
+    Adapter class to wrap QuantumAttentionHybrid for integration into UNetBlock.
+    Handles shape transformation from [B, C, H, W] to [B, S, C] and back.
+    """
+    def __init__(self, in_channels, num_heads=4, device_name='cuda', **kwargs):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_heads = num_heads
+        
+        # Calculate qk_dim based on input channels and heads
+        # Ensure divisible
+        if in_channels % num_heads != 0:
+            # Fallback or error? For now, we assume it's divisible as per UNet logic
+            qk_dim = in_channels // num_heads
+        else:
+            qk_dim = in_channels // num_heads
+            
+        self.attn = QuantumAttentionHybrid(
+            input_dim=in_channels,
+            N_QUBITS=6, # Fixed for now
+            qk_dim=qk_dim,
+            n_heads=num_heads, # Passed to QuantumAttention64 base
+            device_name=device_name,
+            **kwargs
+        )
+
+    def forward(self, x: torch.Tensor, num_heads: Optional[int] = None) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape [B, C, H, W]
+            num_heads: Optional override (ignored for now as init fixes it)
+        Returns:
+            Output tensor of shape [B, C, H, W]
+        """
+        B, C, H, W = x.shape
+        # Reshape to [B, S, C] where S = H*W
+        x_flat = x.permute(0, 2, 3, 1).reshape(B, H*W, C)
+        
+        # Forward pass through Quantum Attention
+        # Note: QuantumAttentionHybrid expects [B, S, D]
+        out_flat = self.attn(x_flat)
+        
+        # Reshape back to [B, C, H, W]
+        out = out_flat.reshape(B, H, W, C).permute(0, 3, 1, 2)
+        
+        return out

@@ -408,7 +408,7 @@ class UNetBlockIntegrated(nn.Module):
             style_dim=emb_dim, 
             n_qubits_data=4,
             n_qubits_ancilla=2,
-            n_layers=4, # Double depth to match Separated capacity
+            n_layers=8, # Optimized: Depth 8
             n_groups=8,
             stride=1,
             reupload_data=True,

@@ -1,0 +1,138 @@
+Using device: cuda
+
+=== Benchmark 1: Time Embedding Capacity ===
+Classic Params: 16576
+Hybrid Quantum Params: 13768
+Pure Quantum Params: 97
+LinearOnly Params: 12744
+
+Training...
+Step 0: C=0.57438, HybridQ=0.88533, PureQ=0.52869, L_Only=0.88055
+Step 50: C=0.05338, HybridQ=0.00209, PureQ=0.51478, L_Only=0.00344
+Step 100: C=0.00471, HybridQ=0.00058, PureQ=0.50352, L_Only=0.00064
+Step 150: C=0.00018, HybridQ=0.00047, PureQ=0.49233, L_Only=0.00049
+Step 199: C=0.00001, HybridQ=0.00044, PureQ=0.48229, L_Only=0.00045
+Final: C=0.00001, HybridQ=0.00044, PureQ=0.48229, L_Only=0.00045
+
+=== Benchmark 2: Realistic Spatial Modulation (QCNN vs Classic) ===
+Classic Params: 180864
+Quantum Params: 151814
+
+Training...
+Step 0: Loss C=1.66817, Loss Q=1.67588
+Step 20: Loss C=0.76304, Loss Q=0.12532
+Step 40: Loss C=0.35443, Loss Q=0.04025
+Step 60: Loss C=0.17913, Loss Q=0.01736
+Step 80: Loss C=0.09945, Loss Q=0.00850
+Step 99: Loss C=0.06053, Loss Q=0.00466
+Final Loss: C=0.06053, Q=0.00466
+
+=== Benchmark 3: Full Hybrid Block (Classic Time/Affine + Quantum Spatial) ===
+Classic Params: 312576
+Quantum (Hybrid) Params: 283526
+
+Training...
+Step 0: Loss C=1.50116, Loss Q=1.54169
+Step 20: Loss C=0.49488, Loss Q=0.09378
+Step 40: Loss C=0.20395, Loss Q=0.02977
+Step 60: Loss C=0.11516, Loss Q=0.01311
+Step 80: Loss C=0.07240, Loss Q=0.00712
+Step 99: Loss C=0.04913, Loss Q=0.00427
+Final Loss: C=0.04913, Q=0.00427
+
+=== Benchmark 5: Realistic U-Net Block Integration (The Sandwich Test) ===
+Classic Params: 427008
+Quantum Params: 302214
+
+Training...
+Step 0: Loss C=2.18957, Loss Q=2.29517
+Step 20: Loss C=1.09431, Loss Q=1.08780
+Step 40: Loss C=0.84324, Loss Q=0.81769
+Step 60: Loss C=0.49366, Loss Q=0.50171
+Step 80: Loss C=0.28692, Loss Q=0.31487
+Step 100: Loss C=0.16920, Loss Q=0.19774
+Step 120: Loss C=0.10171, Loss Q=0.13031
+Step 140: Loss C=0.06635, Loss Q=0.09219
+Step 160: Loss C=0.04235, Loss Q=0.06374
+Step 180: Loss C=0.02945, Loss Q=0.04493
+Step 199: Loss C=0.02238, Loss Q=0.03238
+Final Loss: C=0.02238, Q=0.03238
+
+=== Benchmark 6: Quantum U-Net Architectures Comparison ===
+Classic Ref Params: 427008
+Separated Params: 433944
+Integrated Params: 154962
+
+Training...
+Step 0: Loss Ref=2.18957, Loss Sep=2.19203, Loss Int=2.29448
+Step 20: Loss Ref=1.09431, Loss Sep=0.56364, Loss Int=0.48993
+Step 40: Loss Ref=0.84324, Loss Sep=0.19471, Loss Int=0.21800
+Step 60: Loss Ref=0.49366, Loss Sep=0.07109, Loss Int=0.12678
+Step 80: Loss Ref=0.28692, Loss Sep=0.04175, Loss Int=0.08314
+Step 100: Loss Ref=0.16920, Loss Sep=0.01372, Loss Int=0.05800
+Step 120: Loss Ref=0.10171, Loss Sep=0.00683, Loss Int=0.04202
+Step 140: Loss Ref=0.06635, Loss Sep=0.00315, Loss Int=0.03121
+Step 160: Loss Ref=0.04235, Loss Sep=0.01384, Loss Int=0.02360
+Step 180: Loss Ref=0.02945, Loss Sep=0.00279, Loss Int=0.01808
+Step 199: Loss Ref=0.02238, Loss Sep=0.00075, Loss Int=0.01417
+Final Loss: Ref=0.02238, Sep=0.00075, Int=0.01417
+
+=== Benchmark 7: Ablation Study (Quantum vs Linear Replacement) ===
+Quantum Params: 433944
+Linear Params: 138112
+
+Training...
+Step 0: Loss Q=2.18239, Loss Linear=2.04378
+Step 20: Loss Q=0.59285, Loss Linear=1.12503
+Step 40: Loss Q=0.21138, Loss Linear=1.03473
+Step 60: Loss Q=0.07779, Loss Linear=0.95941
+Step 80: Loss Q=0.03045, Loss Linear=0.88588
+Step 100: Loss Q=0.02797, Loss Linear=0.83107
+Step 120: Loss Q=0.00985, Loss Linear=0.79065
+Step 140: Loss Q=0.00343, Loss Linear=0.76584
+Step 160: Loss Q=0.00170, Loss Linear=0.74810
+Step 180: Loss Q=0.00086, Loss Linear=0.73073
+Step 199: Loss Q=0.00046, Loss Linear=0.70664
+Final Loss: Q=0.00046, Linear=0.70664
+
+=== Benchmark 4: Progressive Training (Layer-wise) ===
+Training E2E vs Progressive...
+Phase 1 End (Step 50): E2E=0.00152, Prog=0.00155
+Phase 2 End (Step 100): E2E=0.00001, Prog=0.00002
+
+=== Benchmark 8: Rich Injection Strategy (Simple vs Rich) ===
+Simple Injection Params: 154962
+Rich Injection Params: 286290
+
+Training...
+Step 0: Loss Simple=2.35451, Loss Rich=2.38378
+Step 20: Loss Simple=0.52635, Loss Rich=0.53422
+Step 40: Loss Simple=0.23746, Loss Rich=0.24149
+Step 60: Loss Simple=0.13844, Loss Rich=0.14095
+Step 80: Loss Simple=0.09062, Loss Rich=0.09229
+Step 100: Loss Simple=0.06304, Loss Rich=0.06417
+Step 120: Loss Simple=0.04554, Loss Rich=0.04631
+Step 140: Loss Simple=0.03377, Loss Rich=0.03430
+Step 160: Loss Simple=0.02552, Loss Rich=0.02588
+Step 180: Loss Simple=0.01955, Loss Rich=0.01980
+Step 199: Loss Simple=0.01533, Loss Rich=0.01551
+Final Loss: Simple=0.01533, Rich=0.01551
+
+=== Benchmark 9: Direct Encoding (Rx-Ry-Rz Serial) vs Standard Projection ===
+DirectQuantumFrontEnd: Patch Dim=144, Qubits=4, Layers=12
+Standard Params: 433944
+Direct Params: 134160
+
+Training...
+Step 0: Loss Std=2.16461, Loss Direct=2.21192
+Step 20: Loss Std=0.59544, Loss Direct=1.27631
+Step 40: Loss Std=0.19383, Loss Direct=1.23906
+Step 60: Loss Std=0.06828, Loss Direct=1.22778
+Step 80: Loss Std=0.02546, Loss Direct=1.21578
+Step 100: Loss Std=0.01003, Loss Direct=1.20309
+Step 120: Loss Std=0.00515, Loss Direct=1.19237
+Step 140: Loss Std=0.00244, Loss Direct=1.18400
+Step 160: Loss Std=0.00135, Loss Direct=1.17768
+Step 180: Loss Std=0.00064, Loss Direct=1.17266
+Step 199: Loss Std=0.00033, Loss Direct=1.16874
+Final Loss: Std=0.00033, Direct=1.16874

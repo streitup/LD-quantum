@@ -19,7 +19,7 @@ from torch.nn.functional import silu
 # 预条件化封装器（VP/VE/iDDPM/EDM/Patch_EDM）会在 __init__ 中通过 globals()[model_type](...) 构造底层模型。
 # 因此需确保该符号在本模块的全局命名空间可见。
 try:
-    from .quantum_transformer import QuantumTransformerDenoiser, QuantumMLP, QuantumAdaGN, QuantumConv2d, QuantumFrontEndQCNN  # noqa: F401
+    from .quantum_transformer import QuantumTransformerDenoiser, QuantumMLP, QuantumAdaGN, QuantumConv2d, QuantumFrontEndQCNN, QuantumAttentionPatch, QuantumAttentionHybridLite  # noqa: F401
 except Exception as _qt_import_err:
     # 若量子模块不可用，提供一个占位符类，在实例化时给出更友好的错误信息。
     class QuantumTransformerDenoiser:  # type: ignore
@@ -173,7 +173,7 @@ class UNetBlock(torch.nn.Module):
         # [Quantum-Integration Marker] 可选量子 Transformer 开关与适配器
         # 说明：当 attention=True 且 use_quantum_transformer=True 时，forward 将调用
         # quantum_adapter 以替换经典的 qkv+softmax+proj 注意力路径。
-        use_quantum_transformer=False, quantum_adapter=None,
+        use_quantum_transformer=False, quantum_adapter=None, quantum_adapter_kwargs=None,
         use_quantum_affine=False,
         use_qcnn_frontend=False,
         qcnn_chunk_size=4096,
@@ -190,7 +190,52 @@ class UNetBlock(torch.nn.Module):
         self.adaptive_scale = adaptive_scale
         # [Quantum-Integration Marker] 保存量子集成相关参数
         self.use_quantum_transformer = use_quantum_transformer
-        self.quantum_adapter = quantum_adapter
+        
+        # Instantiate Quantum Adapter independently for this block
+        self.quantum_adapter = None
+        if self.use_quantum_transformer and attention and self.num_heads > 0:
+            if isinstance(quantum_adapter, str):
+                try:
+                    module_name, class_name = quantum_adapter.split(':')
+                    mod = importlib.import_module(module_name)
+                    AdapterClass = getattr(mod, class_name)
+                    
+                    # Merge kwargs with dynamic channels
+                    kwargs = (quantum_adapter_kwargs or {}).copy()
+                    kwargs['in_channels'] = out_channels # Pass current block's channels
+                    kwargs['num_heads'] = self.num_heads # Pass calculated num_heads
+                    
+                    self.quantum_adapter = AdapterClass(**kwargs)
+                except Exception as e:
+                    print(f"Warning: Failed to instantiate quantum adapter {quantum_adapter} for block with channels {out_channels}: {e}")
+                    self.use_quantum_transformer = False # Disable if failed
+            elif quantum_adapter is not None:
+                 # Fallback for pre-instantiated object (legacy/simple cases)
+                 self.quantum_adapter = quantum_adapter
+            else:
+                 # [SOTA Default] Use QuantumAttentionHybridLite (SOTA 2024) if no adapter specified
+                 # Documentation: docs/SOTA_QAttn_Algorithm.md
+                 # Features: Lite Classical Q/K + Quantum V (Prob Meas), High Performance
+                 from .quantum_transformer import QuantumAttentionHybridLite
+                 
+                 # Dynamic n_qubits calculation
+                 # For Probability Measurement, output dim is 2^N.
+                 # Optimization: Reduce N from 8 to 6.
+                 # 2^8 = 256 -> V_proj: 256*64 = 16k params.
+                 # 2^6 = 64  -> V_proj: 64*64  = 4k params.
+                 # 6 Qubits (64 dims) matches typical channel width (64/128), efficient.
+                 n_qubits = 6
+                 
+                 dev_name = 'cuda' if torch.cuda.is_available() else 'cpu'
+                 
+                 self.quantum_adapter = QuantumAttentionHybridLite(
+                    input_dim=out_channels,
+                    N_QUBITS=n_qubits,
+                    Q_DEPTH=4,      # SOTA default
+                    n_heads=self.num_heads,
+                    device_name=dev_name
+                 )
+                 
         self.use_quantum_affine = use_quantum_affine
         self.use_qcnn_frontend = use_qcnn_frontend
         self.qcnn_chunk_size = int(qcnn_chunk_size)
@@ -198,42 +243,58 @@ class UNetBlock(torch.nn.Module):
         self.qcnn_reupload = bool(qcnn_reupload)
 
         self.norm0 = GroupNorm(num_channels=in_channels, eps=eps)
-        self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
         
-        # Classic Affine (Always used for classic path, or if we need emb projection)
-        self.affine = Linear(in_features=emb_channels, out_features=out_channels*(2 if adaptive_scale else 1), **init)
+        # [Optimization] Conditional Initialization to save parameters
+        # Conv0 is needed if:
+        # 1. Classic Mode (Always)
+        # 2. Quantum Mode AND (Dimension Change OR Resizing needed)
+        needs_conv0 = (not self.use_qcnn_frontend) or (in_channels != out_channels or up or down)
+        if needs_conv0:
+            self.conv0 = Conv2d(in_channels=in_channels, out_channels=out_channels, kernel=3, up=up, down=down, resample_filter=resample_filter, **init)
+        else:
+            self.conv0 = None
+        
+        # Classic Affine (Only for classic path)
+        if not self.use_qcnn_frontend:
+            self.affine = Linear(in_features=emb_channels, out_features=out_channels*(2 if adaptive_scale else 1), **init)
+        else:
+            self.affine = None
         
         # Architecture 2: Integrated Quantum Block (QuantumFrontEndQCNN)
         if self.use_qcnn_frontend:
             dev_name = 'cuda' if torch.cuda.is_available() else 'cpu'
-            # Architecture 2 Parameters from Benchmark 6
-            # n_groups=8, n_qubits=4, n_layers=4, stride=1
-            # Note: out_channels must be divisible by 8. If not, we might fallback or adjust.
-            n_groups = 8
-            if out_channels % n_groups != 0:
-                n_groups = 4 # Fallback
+            # Architecture 2 Parameters - Matched to test_module_capacity.py Benchmark 6
+            # User Feedback: "Benchmark 6 proved QCNN works better"
+            # Config: Q4_G8_L4 (4 Qubits, 8 Groups, 4 Layers)
+            # This is a Deeper architecture than the Pure QCNN, providing more capacity for complex noise prediction.
             
             self.quantum_frontend = QuantumFrontEndQCNN(
                 channels=out_channels,
                 style_dim=emb_channels, # Raw embedding dimension
-                n_qubits_data=2, # Optimized: 2 Qubits for Amplitude Encoding
+                n_qubits_data=4, # Benchmark 6: 4 Qubits
                 n_qubits_ancilla=2,
-                n_layers=4, # Deep Architecture
+                n_layers=8, # Optimization: Increased depth to 8 for better feature extraction
                 device_name=dev_name,
                 use_strided_cnot=self.qcnn_use_strided,
                 reupload_data=True,
                 max_qdev_bsz=self.qcnn_chunk_size,
-                n_groups=n_groups,
-                use_strong_bypass=False, # Pure Quantum as per Architecture 2
+                n_groups=8, # Benchmark 6: 8 Groups
+                use_strong_bypass=False, # Integrated Logic
                 use_mlp_residual=False,
                 stride=1, # We rely on conv0 for resizing
-                encoding_type='amplitude' # Use Amplitude Encoding
+                encoding_type='tanh', # Default
+                projection_type='linear' # Default
             )
         else:
             self.quantum_frontend = None
             
         self.norm1 = GroupNorm(num_channels=out_channels, eps=eps)
-        self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
+        
+        # Conv1 (Only for classic path)
+        if not self.use_qcnn_frontend:
+            self.conv1 = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=3, **init_zero)
+        else:
+            self.conv1 = None
 
         self.skip = None
         if out_channels != in_channels or up or down:
@@ -242,8 +303,21 @@ class UNetBlock(torch.nn.Module):
 
         if self.num_heads:
             self.norm2 = GroupNorm(num_channels=out_channels, eps=eps)
-            self.qkv = Conv2d(in_channels=out_channels, out_channels=out_channels*3, kernel=1, **(init_attn if init_attn is not None else init))
-            self.proj = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=1, **init_zero)
+            if self.use_quantum_transformer:
+                # [Quantum Optimization] Do NOT create classic qkv if quantum is used.
+                # This saves ~49k parameters (for C=128).
+                self.qkv = None
+            else:
+                self.qkv = Conv2d(in_channels=out_channels, out_channels=out_channels*3, kernel=1, **(init_attn if init_attn is not None else init))
+            
+            if self.use_quantum_transformer:
+                # [Optimization] Avoid double projection.
+                # Quantum Adapter (HybridLite) already has out_proj_lite.
+                # So we make UNetBlock's proj Identity to save 4k params.
+                self.proj = torch.nn.Identity()
+            else:
+                self.proj = Conv2d(in_channels=out_channels, out_channels=out_channels, kernel=1, **init_zero)
+
             if self.use_quantum_transformer and self.quantum_adapter is not None:
                 pass
             elif self.use_quantum_transformer:
@@ -257,13 +331,12 @@ class UNetBlock(torch.nn.Module):
             # Scheme: Norm0 -> QuantumFrontEnd (Integrated) -> Skip
             # Note: We replace Conv0 + Affine + Conv1 with a single Quantum Block.
             
-            # 1. Handle Input Projection if channels change
-            if self.in_channels != self.out_channels:
-                # If dimensions mismatch, we must use Conv0 (or a projection) to match dimensions
-                # because QuantumFrontEnd expects fixed input dimension.
+            # 1. Handle Input Projection / Resampling
+            # If dimensions change OR up/down sampling is needed, we use Conv0
+            if self.conv0 is not None:
                 x = self.conv0(silu(self.norm0(x)))
             else:
-                # If dimensions match, we skip Conv0 entirely!
+                # If dimensions match and no resizing, we skip Conv0 entirely!
                 # Direct Quantum Processing on Normalized Input
                 x = self.norm0(x)
             
@@ -379,16 +452,28 @@ class UNetBlock(torch.nn.Module):
             if self.use_quantum_transformer:
                 if self.quantum_adapter is None:
                     raise RuntimeError("Quantum Transformer enabled but quantum_adapter is None in UNetBlock. This indicates a configuration error or upstream import failure.")
-                # [Quantum-Integration Marker] QSANNAdapter 调用入口（仅 x 接口）
-                attn_out = self.quantum_adapter(x_norm, num_heads=self.num_heads)
+                
+                # [Quantum-Integration Marker] QSANNAdapter / QuantumAttentionPatch 调用入口
+                # Reshape [B, C, H, W] -> [B, H*W, C] for Quantum Transformer
+                B, C, H, W = x_norm.shape
+                x_reshaped = x_norm.permute(0, 2, 3, 1).reshape(B, H*W, C)
+                
+                attn_out = self.quantum_adapter(x_reshaped)
+                
+                # Reshape back [B, H*W, C] -> [B, C, H, W]
+                attn_out = attn_out.reshape(B, H, W, C).permute(0, 3, 1, 2)
+                
                 if not isinstance(attn_out, torch.Tensor):
                     raise TypeError('quantum_adapter must return a torch.Tensor')
                 if attn_out.shape != x.shape:
                     raise RuntimeError(f'quantum_adapter(x) must return tensor of shape {x.shape}, got {attn_out.shape}')
                 # 保持与经典路径一致的投影位置：对 attn_out 施加 proj（1x1 conv）再加残差
                 x = self.proj(attn_out).add_(x)
-            elif False: # Classical path disabled/removed in this version for clarity or by user design
-                pass 
+            else: # Classical path (Default for Hybrid Architecture)
+                q, k, v = self.qkv(x_norm).reshape(x.shape[0] * self.num_heads, x.shape[1] // self.num_heads, 3, -1).unbind(2)
+                w = AttentionOp.apply(q, k)
+                a = torch.einsum('nqk,nck->ncq', w, v)
+                x = self.proj(a.reshape(*x.shape)).add_(x)
             x = x * self.skip_scale
         return x
 
@@ -479,22 +564,35 @@ class SongUNet(torch.nn.Module):
         init = dict(init_mode='xavier_uniform')
         init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
         init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
+        # [Hybrid Architecture Enforcement]
+        # 根据 Benchmark 结果，Hybrid 架构（QCNN 前端 + 经典注意力）优于纯量子架构（QCNN + 量子注意力）。
+        # 因此，当启用 QCNN 前端时，强制禁用量子注意力，以结合两者的最佳特性：
+        # 1. QCNN 的强特征提取能力（已在全网络启用）。
+        # 2. 经典注意力的稳定上下文建模能力。
+        if use_qcnn_frontend:
+            use_quantum_transformer = False
+            quantum_adapter = None
+
         # [Quantum-Integration Marker] 解析并实例化量子适配器（如提供字符串路径）
-        adapter_obj = None
-        if use_quantum_transformer:
-            if isinstance(quantum_adapter, str):
-                module_name, class_name = quantum_adapter.split(':')
-                mod = importlib.import_module(module_name)
-                AdapterClass = getattr(mod, class_name)
-                adapter_obj = AdapterClass(**(quantum_adapter_kwargs or {}))
-            else:
-                adapter_obj = quantum_adapter
+        # Modify: Pass raw configuration to blocks for independent instantiation
+        # adapter_obj = None
+        # if use_quantum_transformer:
+        #    if isinstance(quantum_adapter, str):
+        #        module_name, class_name = quantum_adapter.split(':')
+        #        mod = importlib.import_module(module_name)
+        #        AdapterClass = getattr(mod, class_name)
+        #        adapter_obj = AdapterClass(**(quantum_adapter_kwargs or {}))
+        #    else:
+        #        adapter_obj = quantum_adapter
+        
         block_kwargs = dict(
             emb_channels=emb_channels, num_heads=1, dropout=dropout, skip_scale=np.sqrt(0.5), eps=1e-6,
             resample_filter=resample_filter, resample_proj=True, adaptive_scale=False,
             init=init, init_zero=init_zero, init_attn=init_attn,
-            # [Quantum-Integration Marker] 将量子开关与适配器传递给所有 UNetBlock
-            use_quantum_transformer=use_quantum_transformer, quantum_adapter=adapter_obj,
+            # [Quantum-Integration Marker] 将量子开关与适配器配置传递给所有 UNetBlock
+            use_quantum_transformer=use_quantum_transformer, 
+            quantum_adapter=quantum_adapter, # Pass string or class
+            quantum_adapter_kwargs=quantum_adapter_kwargs, # Pass kwargs
             use_quantum_affine=use_quantum_affine,
             use_qcnn_frontend=use_qcnn_frontend,
             qcnn_chunk_size=qcnn_chunk_size,
@@ -724,7 +822,7 @@ class DhariwalUNet(torch.nn.Module):
                 cout = model_channels * mult
                 attn = (res in attn_resolutions)
                 _bk = dict(block_kwargs)
-                _bk.update(use_qcnn_frontend=(bool(use_qcnn_frontend) and attn))
+                _bk.update(use_qcnn_frontend=bool(use_qcnn_frontend))
                 self.enc[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **_bk)
         skips = [block.out_channels for block in self.enc.values()]
 
@@ -737,18 +835,18 @@ class DhariwalUNet(torch.nn.Module):
                 _bk_attn.update(use_qcnn_frontend=bool(use_qcnn_frontend))
                 self.dec[f'{res}x{res}_in0'] = UNetBlock(in_channels=cout, out_channels=cout, attention=True, **_bk_attn)
                 _bk_noattn = dict(block_kwargs)
-                _bk_noattn.update(use_qcnn_frontend=False)
+                _bk_noattn.update(use_qcnn_frontend=bool(use_qcnn_frontend))
                 self.dec[f'{res}x{res}_in1'] = UNetBlock(in_channels=cout, out_channels=cout, **_bk_noattn)
             else:
                 _bk_up = dict(block_kwargs)
-                _bk_up.update(use_qcnn_frontend=False)
+                _bk_up.update(use_qcnn_frontend=bool(use_qcnn_frontend))
                 self.dec[f'{res}x{res}_up'] = UNetBlock(in_channels=cout, out_channels=cout, up=True, **_bk_up)
             for idx in range(num_blocks + 1):
                 cin = cout + skips.pop()
                 cout = model_channels * mult
                 attn = (res in attn_resolutions)
                 _bk = dict(block_kwargs)
-                _bk.update(use_qcnn_frontend=(bool(use_qcnn_frontend) and attn))
+                _bk.update(use_qcnn_frontend=bool(use_qcnn_frontend))
                 self.dec[f'{res}x{res}_block{idx}'] = UNetBlock(in_channels=cin, out_channels=cout, attention=attn, **_bk)
         self.out_norm = GroupNorm(num_channels=cout)
         self.out_conv = Conv2d(in_channels=cout, out_channels=out_channels, kernel=3, **init_zero)
@@ -1045,7 +1143,8 @@ class Patch_EDMPrecond(torch.nn.Module):
         self.sigma_data = sigma_data
         self.out_channels = img_channels if out_channels is None else out_channels
         # [Quantum-Integration Marker] 模型构造位置（底层 UNet 实例化，支持 x_pos 额外通道）
-        self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels, out_channels=self.out_channels, label_dim=label_dim, **model_kwargs)
+        # 修正：Patch_EDMPrecond 总是会拼接 x_pos (2通道)，因此底层模型的输入通道数需要+2
+        self.model = globals()[model_type](img_resolution=img_resolution, in_channels=img_channels+2, out_channels=self.out_channels, label_dim=label_dim, **model_kwargs)
 
     def forward(self, x, sigma, x_pos=None, class_labels=None, force_fp32=False, **model_kwargs):
         x = x.to(torch.float32)

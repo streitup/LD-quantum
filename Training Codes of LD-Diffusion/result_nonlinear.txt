@@ -1,0 +1,19 @@
+Using device: cuda
+
+=== Benchmark 10: Non-Linear Projection (MLP) vs Linear Projection ===
+Linear Projection Params: 154962
+Non-Linear Projection Params: 175842
+
+Training...
+Step 0: Loss Linear=1.68624, Loss NonLinear=1.70799
+Step 20: Loss Linear=0.40985, Loss NonLinear=0.40717
+Step 40: Loss Linear=0.19322, Loss NonLinear=0.19090
+Step 60: Loss Linear=0.11219, Loss NonLinear=0.10989
+Step 80: Loss Linear=0.07228, Loss NonLinear=0.06962
+Step 100: Loss Linear=0.04943, Loss NonLinear=0.04625
+Step 120: Loss Linear=0.03511, Loss NonLinear=0.03160
+Step 140: Loss Linear=0.02554, Loss NonLinear=0.02204
+Step 160: Loss Linear=0.01889, Loss NonLinear=0.01564
+Step 180: Loss Linear=0.01413, Loss NonLinear=0.01126
+Step 199: Loss Linear=0.01081, Loss NonLinear=0.00833
+Final Loss: Linear=0.01081, NonLinear=0.00833

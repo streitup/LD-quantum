@@ -88,15 +88,15 @@ def parse_int_list(s):
 @click.option('--attn-type', help='Attention type for quantum_transformer backbone', metavar='quantum|classic', type=click.Choice(['quantum','classic']), default='quantum', show_default=True)
 
 # Quantum attention adapter options for classical UNet (SongUNet/DhariwalUNet).
-@click.option('--quantum-attn-in-unet', help='Enable QSANN-based attention replacement inside classical UNet blocks (SongUNet/DhariwalUNet).', metavar='BOOL', type=bool, default=False, show_default=True)
-@click.option('--quantum-adapter', help='Adapter path "module:Class" to import (default: QuantumTransformer.QSANNAdapter:QSANNAdapter).', metavar='STR', type=str, default='QuantumTransformer.QSANNAdapter:QSANNAdapter', show_default=True)
+@click.option('--quantum-attn-in-unet', help='Enable QSANN-based attention replacement inside classical UNet blocks (SongUNet/DhariwalUNet).', metavar='BOOL', type=bool, default=True, show_default=True)
+@click.option('--quantum-adapter', help='Adapter path "module:Class" to import (default: training.quantum_transformer:QuantumAdapterHybridLite).', metavar='STR', type=str, default='training.quantum_transformer:QuantumAdapterHybridLite', show_default=True)
 @click.option('--quantum-qk-norm', help='Normalization for q/k projection inside adapter.', metavar='STR', type=click.Choice(['none', 'layernorm']), default='layernorm', show_default=True)
 @click.option('--quantum-tau', help='RBF attention temperature (if set, overrides adapter default).', metavar='FLOAT', type=float)
 @click.option('--quantum-tau-trainable', help='Whether the RBF temperature is trainable via softplus.', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--quantum-attn-chunk', help='Chunk size for QSANN attention batched simulation (0 disables chunking).', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--use_quantum_mlp', help='Enable QuantumMLP for time embedding.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--use_quantum_affine', help='Enable QuantumFrontEndQCNN (Quantum Affine) for spatial features.', metavar='BOOL', type=bool, default=False, show_default=True)
-@click.option('--quantum-frontendqcnn', help='Enable QuantumFrontEndQCNN frontend (decoupled from affine).', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--quantum-frontendqcnn', help='Enable QuantumFrontEndQCNN frontend (decoupled from affine).', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--quantum-qcnn-chunk', help='Chunk size for QCNN batched simulation (0 means no chunking).', metavar='INT', type=click.IntRange(min=0), default=16384, show_default=True)
 @click.option('--quantum-qcnn-strided', help='Enable strided CNOT entanglement in QCNN.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--quantum-qcnn-reupload', help='Enable data re-uploading between QCNN layers.', metavar='BOOL', type=bool, default=False, show_default=True)
@@ -241,6 +241,7 @@ def main(**kwargs):
             prefer_x_interface=True,
             force_fp32_attention=opts.force_fp32_attn,
             attn_chunk_size=opts.quantum_attn_chunk,
+            device_name=c.device,
         )
         if opts.quantum_tau is not None:
             adapter_kwargs['tau'] = float(opts.quantum_tau)
