@@ -1,0 +1,22 @@
+{
+    "11. Angle Encoding (Pure, 8 Qubits)": {
+        "final_psnr": 13.602501525878907,
+        "std_psnr": 0.0,
+        "final_ssim": 0.5478381812572479,
+        "std_ssim": 0.0,
+        "final_lpips": 35.1127921295166,
+        "std_lpips": 0.0,
+        "final_loss": 0.049114456325769426,
+        "params": 119215
+    },
+    "12. Angle Encoding (Pure, 10 Qubits)": {
+        "final_psnr": 13.790451126098633,
+        "std_psnr": 0.0,
+        "final_ssim": 0.56000314950943,
+        "std_ssim": 0.0,
+        "final_lpips": 34.365561981201175,
+        "std_lpips": 0.0,
+        "final_loss": 0.04613119840621948,
+        "params": 267175
+    }
+}

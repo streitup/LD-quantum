@@ -1,0 +1,9 @@
+{
+    "5. SOTA (Single Head)": {
+        "final_psnr": 12.668351364135741,
+        "final_ssim": 0.521385736465454,
+        "final_lpips": 43.23835899353028,
+        "final_loss": 0.12832973301410674,
+        "params": 60147
+    }
+}

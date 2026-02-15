@@ -1,0 +1,9 @@
+{
+    "6. Full Quantum SOTA": {
+        "final_psnr": 12.331756362915039,
+        "final_ssim": 0.4782222151756287,
+        "final_lpips": 42.873644256591795,
+        "final_loss": 0.08150492802262306,
+        "params": 64423
+    }
+}

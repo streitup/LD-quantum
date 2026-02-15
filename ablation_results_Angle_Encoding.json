@@ -1,0 +1,22 @@
+{
+    "9. Angle Encoding (Hybrid)": {
+        "final_psnr": 13.663707733154297,
+        "std_psnr": 0.0,
+        "final_ssim": 0.541902312040329,
+        "std_ssim": 0.0,
+        "final_lpips": 39.26414443969727,
+        "std_lpips": 0.0,
+        "final_loss": 0.058980325758457186,
+        "params": 81847
+    },
+    "10. Angle Encoding (Pure)": {
+        "final_psnr": 13.802741279602051,
+        "std_psnr": 0.0,
+        "final_ssim": 0.5498293972015381,
+        "std_ssim": 0.0,
+        "final_lpips": 38.208402709960936,
+        "std_lpips": 0.0,
+        "final_loss": 0.05403317980468273,
+        "params": 81847
+    }
+}

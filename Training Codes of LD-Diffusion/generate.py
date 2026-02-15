@@ -364,7 +364,7 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, vae_local_dir,
 
     net_out_ch  = getattr(net, 'out_channels', None)
     # Other ranks follow.
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and dist.get_world_size() > 1:
         torch.distributed.barrier()
 
     decode_latents = False
@@ -385,7 +385,8 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, vae_local_dir,
     # Loop over batches.
     dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
     for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
+        if dist.get_world_size() > 1:
+            torch.distributed.barrier()
         batch_size = len(batch_seeds)
         if batch_size == 0:
             continue
@@ -459,7 +460,8 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, vae_local_dir,
                 PIL.Image.fromarray(image_np, 'RGB').save(image_path)
 
     # Done.
-    torch.distributed.barrier()
+    if dist.get_world_size() > 1:
+        torch.distributed.barrier()
     dist.print0('Done.')
 
 #----------------------------------------------------------------------------

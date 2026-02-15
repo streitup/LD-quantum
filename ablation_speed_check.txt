@@ -1,0 +1,24 @@
+Running SOTA Ablation Experiment on cuda
+Loading dataset from /home/zzn/qfl_tq/ffhq_workspace/100-shot-obama-128.zip
+Data Resolution: 3x16x16
+/home/zzn/.local/lib/python3.12/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/zzn/.local/lib/python3.12/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+
+--- Training Model: 0. Pure Classic (No QCNN) ---
+  Total Block Params: 123776
+  [Result] PSNR: 18.13 | SSIM: 0.7998 | LPIPS: 22537.07
+  [Perf] Time: 1.63s
+
+--- Training Model: 1. Classic Attn + QCNN ---
+  Total Block Params: 59402
+  [Result] PSNR: 19.15 | SSIM: 0.8880 | LPIPS: 18997.67
+  [Perf] Time: 60.37s
+
+
+=== Final Benchmark Results (Converged) ===
+Model                     | Params     | PSNR     | SSIM     | LPIPS    | Time (s)
+--------------------------------------------------------------------------------
+0. Pure Classic (No QCNN) | 123776     | 18.13    | 0.7998   | 22537.07 | 1.63    
+1. Classic Attn + QCNN    | 59402      | 19.15    | 0.8880   | 18997.67 | 60.37   

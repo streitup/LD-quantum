@@ -46,7 +46,7 @@ def calculate_inception_stats(
         raise click.ClickException(f'Found {len(dataset_obj)} images, but need at least 2 to compute statistics')
 
     # Other ranks follow.
-    if dist.get_rank() == 0:
+    if dist.get_rank() == 0 and dist.get_world_size() > 1:
         torch.distributed.barrier()
 
     # Divide images into batches.
@@ -60,7 +60,8 @@ def calculate_inception_stats(
     mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
     sigma = torch.zeros([feature_dim, feature_dim], dtype=torch.float64, device=device)
     for images, _labels in tqdm.tqdm(data_loader, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
+        if dist.get_world_size() > 1:
+            torch.distributed.barrier()
         if images.shape[0] == 0:
             continue
         if images.shape[1] == 1:
@@ -70,8 +71,9 @@ def calculate_inception_stats(
         sigma += features.T @ features
 
     # Calculate grand totals.
-    torch.distributed.all_reduce(mu)
-    torch.distributed.all_reduce(sigma)
+    if dist.get_world_size() > 1:
+        torch.distributed.all_reduce(mu)
+        torch.distributed.all_reduce(sigma)
     mu /= len(dataset_obj)
     sigma -= mu.ger(mu) * len(dataset_obj)
     sigma /= len(dataset_obj) - 1
@@ -133,7 +135,8 @@ def calc(image_path, ref_path, num_expected, seed, batch):
     if dist.get_rank() == 0:
         fid = calculate_fid_from_inception_stats(mu, sigma, ref['mu'], ref['sigma'])
         print(f'{fid:g}')
-    torch.distributed.barrier()
+    if dist.get_world_size() > 1:
+        torch.distributed.barrier()
 
 #----------------------------------------------------------------------------
 
@@ -154,7 +157,8 @@ def ref(dataset_path, dest_path, batch):
             os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         np.savez(dest_path, mu=mu, sigma=sigma)
 
-    torch.distributed.barrier()
+    if dist.get_world_size() > 1:
+        torch.distributed.barrier()
     dist.print0('Done.')
 
 #----------------------------------------------------------------------------

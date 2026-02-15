@@ -1,0 +1,9 @@
+{
+    "4. +Zero-Init (Full SOTA)": {
+        "final_psnr": 12.87775909423828,
+        "final_ssim": 0.5330500066280365,
+        "final_lpips": 41.420734329223635,
+        "final_loss": 0.06987752735614777,
+        "params": 60147
+    }
+}

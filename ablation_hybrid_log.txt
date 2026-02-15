@@ -1,0 +1,24 @@
+Running SOTA Ablation Experiment on cuda
+Loading dataset from /home/zzn/qfl_tq/ffhq_workspace/100-shot-obama-128.zip
+Data Resolution: 3x16x16
+/home/zzn/.local/lib/python3.12/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/zzn/.local/lib/python3.12/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+
+--- Training Model: 5. SOTA (Hybrid Lite) ---
+  Quantum Adapter Params: 14217
+  Total Block Params: 56979
+  Epoch 10/50 | Loss: 0.008242 | PSNR: 23.92 | SSIM: 0.9521
+  Epoch 20/50 | Loss: 0.006293 | PSNR: 24.41 | SSIM: 0.9648
+  Epoch 30/50 | Loss: 0.005612 | PSNR: 25.22 | SSIM: 0.9715
+  Epoch 40/50 | Loss: 0.005471 | PSNR: 26.91 | SSIM: 0.9703
+  Epoch 50/50 | Loss: 0.005401 | PSNR: 26.65 | SSIM: 0.9727
+  [Result] PSNR: 27.96 | SSIM: 0.9786 | LPIPS: 5153.86
+  [Perf] Time: 791.97s
+
+
+=== Final Benchmark Results (Converged) ===
+Model                     | Params     | PSNR     | SSIM     | LPIPS    | Time (s)
+--------------------------------------------------------------------------------
+5. SOTA (Hybrid Lite)     | 56979      | 27.96    | 0.9786   | 5153.86  | 791.97  

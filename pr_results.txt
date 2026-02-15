@@ -1,4 +1,4 @@
-Real: /home/zzn/qfl_tq/quantum-diffusion-main-pure-vqc/100-shot-panda-28x28/
-Fake: /home/zzn/qfl_tq/Quantum-Hybrid-Diffusion-Models-main/Quantum-Hybrid-Diffusion-Models-main/my_images
-Precision: 0.012000
-Recall: 0.000000
+Real: /home/zzn/qfl_tq/LD-Diffusion-quantum-v3/panda_32_real/temp_real_32x32
+Fake: /home/zzn/qfl_tq/LD-Diffusion-quantum-v3/generated_images/panda_500
+Precision: 0.984000
+Recall: 0.980000

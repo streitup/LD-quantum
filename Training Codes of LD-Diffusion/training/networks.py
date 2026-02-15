@@ -19,7 +19,7 @@ from torch.nn.functional import silu
 # 预条件化封装器（VP/VE/iDDPM/EDM/Patch_EDM）会在 __init__ 中通过 globals()[model_type](...) 构造底层模型。
 # 因此需确保该符号在本模块的全局命名空间可见。
 try:
-    from .quantum_transformer import QuantumTransformerDenoiser, QuantumMLP, QuantumAdaGN, QuantumConv2d, QuantumFrontEndQCNN, QuantumAttentionPatch, QuantumAttentionHybridLite  # noqa: F401
+    from .quantum_transformer import QuantumTransformerDenoiser, QuantumMLP, QuantumAdaGN, QuantumConv2d, QuantumFrontEndQCNN, QuantumAttentionPatch, QuantumAttentionHybridLite, QuantumAttentionAngleDense  # noqa: F401
 except Exception as _qt_import_err:
     # 若量子模块不可用，提供一个占位符类，在实例化时给出更友好的错误信息。
     class QuantumTransformerDenoiser:  # type: ignore
@@ -179,6 +179,7 @@ class UNetBlock(torch.nn.Module):
         qcnn_chunk_size=4096,
         qcnn_use_strided=False,
         qcnn_reupload=False,
+        **kwargs # Catch-all for extra params
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -213,27 +214,25 @@ class UNetBlock(torch.nn.Module):
                  # Fallback for pre-instantiated object (legacy/simple cases)
                  self.quantum_adapter = quantum_adapter
             else:
-                 # [SOTA Default] Use QuantumAttentionHybridLite (SOTA 2024) if no adapter specified
+                 # [SOTA Update] Use QuantumAttentionAngleDense (Dense Angle Encoding)
                  # Documentation: docs/SOTA_QAttn_Algorithm.md
-                 # Features: Lite Classical Q/K + Quantum V (Prob Meas), High Performance
-                 from .quantum_transformer import QuantumAttentionHybridLite
+                 # Features: Dense Angle Encoding (Layer-wise Injection), High Expressibility
+                 from .quantum_transformer import QuantumAttentionAngleDense
                  
                  # Dynamic n_qubits calculation
-                 # For Probability Measurement, output dim is 2^N.
-                 # Optimization: Reduce N from 8 to 6.
-                 # 2^8 = 256 -> V_proj: 256*64 = 16k params.
-                 # 2^6 = 64  -> V_proj: 64*64  = 4k params.
                  # 6 Qubits (64 dims) matches typical channel width (64/128), efficient.
                  n_qubits = 6
                  
                  dev_name = 'cuda' if torch.cuda.is_available() else 'cpu'
                  
-                 self.quantum_adapter = QuantumAttentionHybridLite(
-                    input_dim=out_channels,
+                 self.quantum_adapter = QuantumAttentionAngleDense(
+                    in_channels=out_channels,
                     N_QUBITS=n_qubits,
-                    Q_DEPTH=4,      # SOTA default
+                    Q_DEPTH=4,      # SOTA default (Dense Encoding uses depth effectively)
                     n_heads=self.num_heads,
-                    device_name=dev_name
+                    device_name=dev_name,
+                    chunk_size=self.qcnn_chunk_size,
+                    use_checkpoint=True
                  )
                  
         self.use_quantum_affine = use_quantum_affine
@@ -283,7 +282,9 @@ class UNetBlock(torch.nn.Module):
                 use_mlp_residual=False,
                 stride=1, # We rely on conv0 for resizing
                 encoding_type='tanh', # Default
-                projection_type='linear' # Default
+                projection_type='linear', # Default
+                use_mlp_output=kwargs.get('use_mlp_output', False), # Optional MLP output
+                use_checkpoint=True # Enable gradient checkpointing for memory efficiency
             )
         else:
             self.quantum_frontend = None
@@ -564,14 +565,14 @@ class SongUNet(torch.nn.Module):
         init = dict(init_mode='xavier_uniform')
         init_zero = dict(init_mode='xavier_uniform', init_weight=1e-5)
         init_attn = dict(init_mode='xavier_uniform', init_weight=np.sqrt(0.2))
-        # [Hybrid Architecture Enforcement]
+        # [Hybrid Architecture Enforcement] - DISABLED for Ablation Study
         # 根据 Benchmark 结果，Hybrid 架构（QCNN 前端 + 经典注意力）优于纯量子架构（QCNN + 量子注意力）。
         # 因此，当启用 QCNN 前端时，强制禁用量子注意力，以结合两者的最佳特性：
         # 1. QCNN 的强特征提取能力（已在全网络启用）。
         # 2. 经典注意力的稳定上下文建模能力。
-        if use_qcnn_frontend:
-            use_quantum_transformer = False
-            quantum_adapter = None
+        # if use_qcnn_frontend:
+        #    use_quantum_transformer = False
+        #    quantum_adapter = None
 
         # [Quantum-Integration Marker] 解析并实例化量子适配器（如提供字符串路径）
         # Modify: Pass raw configuration to blocks for independent instantiation

@@ -255,6 +255,9 @@ def training_loop(
 
                 if train_on_latents:
                     with torch.no_grad():
+                        # Fix for grayscale images with VAE (e.g. Panda)
+                        if images.shape[1] == 1:
+                            images = images.repeat(1, 3, 1, 1)
                         images = img_vae.encode(images)['latent_dist'].sample()
                         images = latent_scale_factor * images
 

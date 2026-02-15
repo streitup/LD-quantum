@@ -3,6 +3,7 @@ import os
 from typing import Optional, Tuple
 
 import torch
+import torch.utils.checkpoint as checkpoint_utils # Rename to avoid conflict if any
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -20,9 +21,12 @@ except Exception:
 try:
     import torchquantum as tq
     import torchquantum.functional as tqf
+    from torchquantum.functional.gate_wrapper import apply_unitary_einsum, apply_unitary_bmm
     _TQ_AVAILABLE = True
 except Exception:
     _TQ_AVAILABLE = False
+    apply_unitary_einsum = None
+    apply_unitary_bmm = None
 
 from torch_utils import persistence
 
@@ -45,6 +49,25 @@ class _AutocastOff:
         return False
 
 
+class GroupedLinear(nn.Module):
+    """
+    Helper module for Grouped Linear Layer using Conv1d.
+    Reduces parameters by using independent groups.
+    """
+    def __init__(self, in_features, out_features, groups=1):
+        super().__init__()
+        self.conv = nn.Conv1d(in_features, out_features, kernel_size=1, groups=groups)
+    
+    def forward(self, x):
+        # x: [..., in_features]
+        # Reshape to [Batch, in_features, 1] for Conv1d
+        shape = x.shape
+        x_reshaped = x.view(-1, shape[-1], 1)
+        out = self.conv(x_reshaped)
+        # Reshape back to [..., out_features]
+        return out.view(*shape[:-1], -1)
+
+
 class QuantumAttention64(nn.Module):
     """
     QSANN attention strictly aligned with tq_qsann_min_train.py (TQ_QSANN):
@@ -59,28 +82,38 @@ class QuantumAttention64(nn.Module):
 
     def __init__(self,
                  N_QUBITS: int = 6,
-                 Q_DEPTH: int = 4, # Optimized: Depth 4 is sufficient with MHQA
+                 Q_DEPTH: int = 8, # Optimized: Depth 8 (Full Quantum Deep) provides superior expressibility
                  qk_dim: int = 16, # Optimized: Head Dimension (16 * 4 = 64)
-                 n_heads: int = 4, # Optimized: 4 Heads
+                 num_heads: int = 4, # Optimized: 4 Heads
                  tau: float = 0.5,
                  tau_trainable: bool = True,
                  attn_gate_init: float = 0.5,
                  attn_dropout: float = 0.1,
                  qk_norm: str = 'layernorm',
                  force_fp32_attention: bool = True,
-                 device_name: Optional[str] = None):
+                 device_name: Optional[str] = None,
+                 enable_reupload: bool = True,
+                 **kwargs):
         super().__init__()
         if not _TQ_AVAILABLE:
             raise ImportError("TorchQuantum 未安装或不可用：QuantumAttention64 依赖 torchquantum。请先安装 'torchquantum'.")
+        
+        # Handle input dimension (support 'in_channels' or 'input_dim')
+        self.in_channels = kwargs.get('in_channels', kwargs.get('input_dim', 64))
+        
         # assert N_QUBITS == 6, "本实现固定使用 N_QUBITS=6（2^6=64）以匹配 64 维幅度编码。"
-        if N_QUBITS != 6:
+        # [Optimized] Only warn if using strict Amplitude Encoding (64 dims).
+        # Angle Encoding supports variable qubits.
+        is_angle_encoding = 'Angle' in self.__class__.__name__
+        if N_QUBITS != 6 and not is_angle_encoding:
             print(f"Warning: N_QUBITS={N_QUBITS} (Expected 6 for standard 64-dim amp encoding). Ensure dimensions match.")
+        
         assert qk_norm in ('none', 'layernorm')
 
         self.N_QUBITS = int(N_QUBITS)
         self.Q_DEPTH = int(Q_DEPTH)
         self.qk_dim = int(qk_dim)
-        self.num_heads = int(n_heads)
+        self.num_heads = int(num_heads)
         self.inner_dim = self.num_heads * self.qk_dim # 64
         
         self.force_fp32_attention = bool(force_fp32_attention)
@@ -94,15 +127,22 @@ class QuantumAttention64(nn.Module):
 
         # Z measurement and q/k projections
         # Optimized: Multi-Head Projection (64 -> H*D)
-        # Multi-Basis Update: Input is 64 (Z-probs)
-        self.input_dim = 64
-        self.q_proj = nn.Linear(self.input_dim, self.inner_dim) 
-        self.k_proj = nn.Linear(self.input_dim, self.inner_dim) 
-        self.v_proj = nn.Linear(self.input_dim, self.inner_dim) 
+        # Multi-Basis Update: Input is 2**N_QUBITS (Probabilities)
+        self.input_dim = 2 ** self.N_QUBITS
+        # [Optimized] Use GroupedLinear (groups=2) to reduce classical parameters
+        self.q_proj = GroupedLinear(self.input_dim, self.inner_dim, groups=2) 
+        self.k_proj = GroupedLinear(self.input_dim, self.inner_dim, groups=2) 
+        self.v_proj = GroupedLinear(self.input_dim, self.inner_dim, groups=2) 
         self.qk_ln  = nn.LayerNorm(self.inner_dim) if qk_norm == 'layernorm' else nn.Identity()
         
         # Output Projection (to match standard MultiheadAttention)
-        self.out_proj = nn.Linear(self.inner_dim, 64)
+        # [Optimized] Use GroupedLinear (groups=2)
+        self.out_proj = GroupedLinear(self.inner_dim, self.in_channels, groups=2)
+        
+        # SOTA Improvement: Zero-Initialization
+        # Force output projection weights and bias to zero for stable training start
+        nn.init.zeros_(self.out_proj.conv.weight)
+        nn.init.zeros_(self.out_proj.conv.bias)
 
         # Attention dropout (residual gating moved to AdaLN-Zero in the block)
         self.attn_drop = nn.Dropout(p=float(attn_dropout))
@@ -118,10 +158,15 @@ class QuantumAttention64(nn.Module):
 
         # Learnable Input Scaling (pre-encoding) replaced by Full Projection
         # This matches Classical Attention's ability to mix features before processing
-        self.inp_proj = nn.Linear(64, 64)
+        # Use self.in_channels (default 64)
+        self.inp_proj = nn.Linear(self.in_channels, 64)
         
-        # Data Re-uploading Projector (64 -> 6)
-        self.reupload_proj = nn.Linear(64, self.N_QUBITS)
+        # Data Re-uploading Projector (in_channels -> 6)
+        self.enable_reupload = enable_reupload
+        if self.enable_reupload:
+            self.reupload_proj = nn.Linear(self.in_channels, self.N_QUBITS)
+        else:
+            self.reupload_proj = None
 
         # Trainable Measurement Basis (U3 before measurement)
         # For Q, K (Expectation based) and V (Prob based)
@@ -132,6 +177,14 @@ class QuantumAttention64(nn.Module):
         # numerical stability epsilon
         self.eps = 1e-9
         self._printed_exec = False
+        
+        # [Optimization] Device Reuse to speed up training
+        self.reuse_device = True
+        self._qdev_cached = None
+        self._qdev_cached_bsz = None
+        self._qdev_common_cached = None
+        self._qdev_common_cached_bsz = None
+
 
     # --- internal helpers ---
     def _apply_pqc(self, qdev: 'tq.QuantumDevice', weights: torch.Tensor, x_reupload: Optional[torch.Tensor] = None):
@@ -181,7 +234,9 @@ class QuantumAttention64(nn.Module):
             states = qdev.get_states_1d()
         else:
             states = qdev.states
-        probs = (states.abs() ** 2)  # (bsz, 64)
+        # Optimized: Avoid sqrt in abs() since we square it anyway
+        # probs = (states.abs() ** 2)
+        probs = states.real**2 + states.imag**2
         return probs
 
     # --- branches ---
@@ -251,19 +306,92 @@ class QuantumAttention64(nn.Module):
         probs_z = self._measure_probs(qdev) # [bsz, 64]
         return probs_z
 
+    def _apply_pqc_batched(self, qdev: 'tq.QuantumDevice', weights_q: torch.Tensor, weights_k: torch.Tensor, weights_v: torch.Tensor, bsz: int, x_reupload: Optional[torch.Tensor] = None):
+        """
+        Apply PQC to a unified device containing [Q_batch, K_batch, V_batch].
+        weights_*: [Depth, N_QUBITS, 3]
+        bsz: Batch size for ONE branch (total device bsz = 3 * bsz)
+        x_reupload: [bsz, N_QUBITS] (angles) or None. If provided, replicated for 3 branches.
+        """
+        depth = weights_q.shape[0]
+        reupload_idx = depth // 2
+        
+        # Pre-expand reupload angles if needed: [bsz, N] -> [3*bsz, N]
+        if x_reupload is not None:
+            x_reupload_all = x_reupload.repeat(3, 1) # [3*bsz, N]
+        
+        for l in range(depth):
+            # Apply Data Re-uploading at the middle
+            if x_reupload is not None and l == reupload_idx:
+                for i in range(self.N_QUBITS):
+                    # x_reupload_all[:, i] is [3*bsz]
+                    tqf.rx(qdev, wires=i, params=x_reupload_all[:, i])
+            
+            # Prepare batched parameters for this layer
+            # Each weight[l, i, :] is (3,) -> Rx, Ry, Ent_Ry
+            # We need to construct params [3*bsz] for each rotation
+            
+            # 1. Rx
+            # [N_QUBITS]
+            rx_q = weights_q[l, :, 0]
+            rx_k = weights_k[l, :, 0]
+            rx_v = weights_v[l, :, 0]
+            
+            # 2. Ry
+            ry_q = weights_q[l, :, 1]
+            ry_k = weights_k[l, :, 1]
+            ry_v = weights_v[l, :, 1]
+            
+            # 3. Ent_Ry
+            ery_q = weights_q[l, :, 2]
+            ery_k = weights_k[l, :, 2]
+            ery_v = weights_v[l, :, 2]
+            
+            # Local Rotations
+            for i in range(self.N_QUBITS):
+                # Construct params: [bsz_q, bsz_k, bsz_v] -> [3*bsz]
+                # scalar .expand(bsz) -> [bsz]
+                p_rx = torch.cat([
+                    rx_q[i].expand(bsz),
+                    rx_k[i].expand(bsz),
+                    rx_v[i].expand(bsz)
+                ], dim=0)
+                tqf.rx(qdev, wires=i, params=p_rx)
+                
+                p_ry = torch.cat([
+                    ry_q[i].expand(bsz),
+                    ry_k[i].expand(bsz),
+                    ry_v[i].expand(bsz)
+                ], dim=0)
+                tqf.ry(qdev, wires=i, params=p_ry)
+                
+            # Linear CNOT chain (entanglement is topology-dependent, not param-dependent, so just run it)
+            for i in range(self.N_QUBITS - 1):
+                tqf.cnot(qdev, wires=[i, i + 1])
+                
+            # Post-entanglement Rotations
+            for i in range(self.N_QUBITS):
+                p_ery = torch.cat([
+                    ery_q[i].expand(bsz),
+                    ery_k[i].expand(bsz),
+                    ery_v[i].expand(bsz)
+                ], dim=0)
+                tqf.ry(qdev, wires=i, params=p_ery)
+
     def _forward_impl(self, x_64: torch.Tensor, device_name: str) -> torch.Tensor:
-        # Optimized implementation: Common Encoding Fork
+        # Optimized implementation: Common Encoding Fork + Batch Parallel Execution
         # 1. Prepare common state |psi_enc> = U_enc(AmplitudeEncode(x))
         B, S, D = x_64.shape
         bsz = B * S
         x_bsz = x_64.reshape(bsz, D)
         
         # Apply Input Projection (Linear Mix) before Amplitude Encoding
-        x_bsz = self.inp_proj(x_bsz)
+        # [Fix] Keep original for reupload_proj
+        x_bsz_proj = self.inp_proj(x_bsz)
         
         # Create common device
         qdev_common = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        self._amplitude_encode(qdev_common, x_bsz)
+        self._amplitude_encode(qdev_common, x_bsz_proj)
         self._apply_pqc(qdev_common, self.enc_w)
         
         # Get common state (Flattened)
@@ -274,94 +402,71 @@ class QuantumAttention64(nn.Module):
             common_states_flat = qdev_common.states.reshape(bsz, -1)
         
         # Prepare state for injection: [B] + [2]*N
-        target_shape = [bsz] + [2] * self.N_QUBITS
-        common_states_reshaped = common_states_flat.reshape(target_shape)
+        # We need to replicate this state 3 times for Q, K, V branches
+        # common_states_flat: [bsz, 2^N]
+        # target: [3*bsz, 2^N]
+        common_states_3x = common_states_flat.repeat(3, 1)
+        target_shape_3x = [3 * bsz] + [2] * self.N_QUBITS
+        common_states_reshaped = common_states_3x.reshape(target_shape_3x)
         
         # Prepare Data Re-uploading Angles (Tanh -> Pi)
         # x_bsz: [bsz, 64] -> [bsz, 18] -> Tanh -> * Pi
-        reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
-
-        # 2. Fork to Q/K/V branches
-        # Q Branch
-        qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        qdev_q.states = common_states_reshaped.clone() # Direct set
-        self._apply_pqc(qdev_q, self.q_w, x_reupload=reupload_angles)
-        # Trainable Measurement Basis
-        for i in range(self.N_QUBITS):
-            # Explicit unpacking to avoid ambiguity in tqf.u3
-            theta = self.meas_q_w[i][0]
-            phi = self.meas_q_w[i][1]
-            lam = self.meas_q_w[i][2]
-            # Must stack to create a tensor, not a list of tensors
-            tqf.u3(qdev_q, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
-        # Optimized: Measure Probs (64)
-        probs_q = self._measure_multibasis(qdev_q) # (bsz, 64)
+        if self.enable_reupload:
+            reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
+        else:
+            reupload_angles = None
+            
+        # 2. Unified Q/K/V Execution
+        # Create ONE device for 3*bsz
+        qdev_all = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=3*bsz, device=device_name)
+        qdev_all.states = common_states_reshaped.clone() # Direct set
         
-        # Normalize and Project
-        # q_flat = F.layer_norm(probs_q, normalized_shape=(64,)) # Removed LayerNorm on probs
-        q = self.qk_ln(self.q_proj(probs_q)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3) # [B, H, S, D]
+        # Apply Batched PQC (Q, K, V weights in parallel)
+        self._apply_pqc_batched(qdev_all, self.q_w, self.k_w, self.v_w, bsz, x_reupload=reupload_angles)
+        
+        # Apply Batched Measurement Basis
+        # meas_q_w: [N, 3]
+        for i in range(self.N_QUBITS):
+            # Construct [3*bsz, 3] params for u3
+            # q_params: [bsz, 3]
+            p_q = self.meas_q_w[i].unsqueeze(0).expand(bsz, -1)
+            p_k = self.meas_k_w[i].unsqueeze(0).expand(bsz, -1)
+            p_v = self.meas_v_w[i].unsqueeze(0).expand(bsz, -1)
+            
+            p_all = torch.cat([p_q, p_k, p_v], dim=0) # [3*bsz, 3]
+            tqf.u3(qdev_all, wires=i, params=p_all)
+            
+        # Unified Measurement
+        probs_all = self._measure_multibasis(qdev_all) # [3*bsz, 64]
+        
+        # Split results
+        probs_q, probs_k, probs_v = torch.chunk(probs_all, 3, dim=0) # Each [bsz, 64]
+        
+        # 3. Post-Processing (Project & Attention)
+        
+        # Q Branch
+        q = self.qk_ln(self.q_proj(probs_q)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
         
         # K Branch
-        qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        qdev_k.states = common_states_reshaped.clone()
-        self._apply_pqc(qdev_k, self.k_w, x_reupload=reupload_angles)
-        # Trainable Measurement Basis
-        for i in range(self.N_QUBITS):
-            # Explicit unpacking
-            theta = self.meas_k_w[i][0]
-            phi = self.meas_k_w[i][1]
-            lam = self.meas_k_w[i][2]
-            tqf.u3(qdev_k, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
-        # Optimized: Measure Probs (64)
-        probs_k = self._measure_multibasis(qdev_k) # (bsz, 64)
-        
-        # Normalize and Project
-        # k_flat = F.layer_norm(probs_k, normalized_shape=(64,))
-        k = self.qk_ln(self.k_proj(probs_k)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3) # [B, H, S, D]
+        k = self.qk_ln(self.k_proj(probs_k)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
         
         # V Branch
-        qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        qdev_v.states = common_states_reshaped.clone()
-        self._apply_pqc(qdev_v, self.v_w, x_reupload=reupload_angles)
-        # Trainable Measurement Basis
-        for i in range(self.N_QUBITS):
-            # Explicit unpacking
-            theta = self.meas_v_w[i][0]
-            phi = self.meas_v_w[i][1]
-            lam = self.meas_v_w[i][2]
-            tqf.u3(qdev_v, wires=i, params=torch.stack([theta, phi, lam], dim=-1))
-        # Optimized: Measure Probs (64)
-        probs_v = self._measure_multibasis(qdev_v)
+        v = self.v_proj(probs_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
         
-        # Normalize and Project
-        # v_flat = F.layer_norm(probs_v, normalized_shape=(64,)) 
-        v = self.v_proj(probs_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3) # New: with proj
-
-
-        # Dot-Product Attention (Standard Transformer)
-        # q, k: [B, H, S, D]
-        # score: [B, H, S, S]
+        # Dot-Product Attention
         attn_score = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.qk_dim)
-        
-        # Softmax normalization
         alpha = torch.softmax(attn_score, dim=-1)
-        alpha = self.attn_drop(alpha) # Apply dropout to probabilities
-        
-        # Weighted sum: [B,H,S,S] @ [B,H,S,D] -> [B,H,S,D]
+        alpha = self.attn_drop(alpha)
         attn_out = torch.matmul(alpha, v)
-        
-        # Concat heads: [B,H,S,D] -> [B,S,H,D] -> [B,S,H*D]
         attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, S, self.inner_dim)
-        
-        # Output Projection
         attn_out = self.out_proj(attn_out)
         
-        # Debug Prints
+        # Debug Prints (Only once)
         if not self._printed_exec:
             self._printed_exec = True
-            print(f"\n[QuantumAttention64] Debug Exec (Optimized Z-Only + Rx-Reupload):")
+            print(f"\n[QuantumAttention64] Debug Exec (Optimized Batch-Parallel Q/K/V):")
             print(f"  Input Shape: {x_64.shape}")
-            print(f"  Probs Q Shape: {probs_q.shape} (Expected 64)")
+            print(f"  Total Batch Size: {3*bsz} (3 branches x {bsz})")
             print(f"  Output Shape: {attn_out.shape}")
             print(f"  Param Count: {sum(p.numel() for p in self.parameters())}")
         
@@ -379,23 +484,22 @@ class QuantumAttentionAngle(QuantumAttention64):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Projector for Angle Encoding (64 -> 12 for 6 qubits Rx+Ry)
-        # Optimized: MLP Projection for richer encoding
-        self.angle_proj = nn.Sequential(
-            nn.Linear(64, 64),
-            nn.GELU(),
-            nn.Linear(64, self.N_QUBITS * 2)
-        )
-        # Re-initialize to ensure fresh weights (last layer)
-        nn.init.xavier_uniform_(self.angle_proj[-1].weight)
-        nn.init.zeros_(self.angle_proj[-1].bias)
+        # Projector for Angle Encoding (in_channels -> 12 for 6 qubits Rx+Ry)
+        # [Optimized] Single Linear Projection (matches SOTA Dense simplification)
+        self.angle_proj = nn.Linear(self.in_channels, self.N_QUBITS * 2)
         
-        # Residual Classical Projections (Hybrid-Residual Architecture)
-        # Allows the model to default to Classical Attention performance if Quantum is noisy
-        # q = Q_Quantum(x) + Q_Classical(x)
-        self.q_res_proj = nn.Linear(64, self.inner_dim)
-        self.k_res_proj = nn.Linear(64, self.inner_dim)
-        self.v_res_proj = nn.Linear(64, self.inner_dim)
+        # Re-initialize to ensure fresh weights
+        nn.init.xavier_uniform_(self.angle_proj.weight)
+        nn.init.zeros_(self.angle_proj.bias)
+        
+        # [Optimized] Remove Classical Residuals to match SOTA and reduce params
+        # This ensures a fair "Quantum vs Quantum" comparison
+        self.q_res_proj = None
+        self.k_res_proj = None
+        self.v_res_proj = None
+
+        # [Optimized] Remove inp_proj from parent (Angle Encoding uses angle_proj directly)
+        self.inp_proj = None
 
         # Learnable Head-wise Temperature (Scale)
         # Initialize to 1/sqrt(qk_dim)
@@ -407,16 +511,13 @@ class QuantumAttentionAngle(QuantumAttention64):
         bsz = B * S
         x_bsz = x_64.reshape(bsz, D)
         
-        # Apply Input Projection
-        x_bsz = self.inp_proj(x_bsz)
+        # [Optimized] No Input Projection (Direct Angle Encoding)
+        # x_bsz = self.inp_proj(x_bsz) -> Removed
         
-        # Calculate Classical Residuals
-        # x_bsz is [bsz, 64], i.e. [B*S, 64]
-        q_res = self.q_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
-        k_res = self.k_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
-        v_res = self.v_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        # [Optimized] No Classical Residuals
+        # q_res, k_res, v_res -> Removed
         
-        # Angle Encoding: 64 -> 12 -> Tanh -> Pi
+        # Angle Encoding: in_channels -> 12 -> Tanh -> Pi
         # Shifted Mapping: [-1, 1] -> [0, pi]
         raw_out = self.angle_proj(x_bsz)
         angles = (torch.tanh(raw_out) + 1.0) * (torch.pi / 2.0)
@@ -447,41 +548,54 @@ class QuantumAttentionAngle(QuantumAttention64):
         
         # Data Re-uploading for branches
         # For consistency with QuantumAttention64, we reuse the reupload_proj (64->6) logic
-        reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
+        # Note: reupload_proj expects in_channels input. x_bsz is [bsz, 64] (actually in_channels)
+        if self.enable_reupload:
+            reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
+        else:
+            reupload_angles = None
 
-        # 2. Fork to Q/K/V branches (Same logic as Parent, just different start state)
-        # Q Branch
-        qdev_q = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        qdev_q.states = common_states_reshaped.clone()
-        self._apply_pqc(qdev_q, self.q_w, x_reupload=reupload_angles)
+        # 2. Fork to Q/K/V branches (Optimized Batch-Parallel)
+        # Prepare Batch: [Q_batch, K_batch, V_batch]
+        # common_states_reshaped: [bsz, 2, 2, ...] -> [3*bsz, 2, 2, ...]
+        # Flatten first:
+        common_states_flat = common_states_reshaped.reshape(bsz, -1)
+        common_states_3x = common_states_flat.repeat(3, 1)
+        target_shape_3x = [3 * bsz] + [2] * self.N_QUBITS
+        common_states_all = common_states_3x.reshape(target_shape_3x)
+        
+        # Create Unified Device
+        qdev_all = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=3*bsz, device=device_name)
+        qdev_all.states = common_states_all.clone()
+        
+        # Apply Batched PQC
+        self._apply_pqc_batched(qdev_all, self.q_w, self.k_w, self.v_w, bsz, x_reupload=reupload_angles)
+        
+        # Apply Batched Measurement Basis
         for i in range(self.N_QUBITS):
-            tqf.u3(qdev_q, wires=i, params=self.meas_q_w[i].unsqueeze(0))
-        probs_q = self._measure_multibasis(qdev_q)
+            # Construct [3*bsz, 3] params for u3
+            p_q = self.meas_q_w[i].unsqueeze(0).expand(bsz, -1)
+            p_k = self.meas_k_w[i].unsqueeze(0).expand(bsz, -1)
+            p_v = self.meas_v_w[i].unsqueeze(0).expand(bsz, -1)
+            
+            p_all = torch.cat([p_q, p_k, p_v], dim=0) # [3*bsz, 3]
+            tqf.u3(qdev_all, wires=i, params=p_all)
+            
+        # Unified Measurement
+        probs_all = self._measure_multibasis(qdev_all) # [3*bsz, 64]
+        
+        # Split results
+        probs_q, probs_k, probs_v = torch.chunk(probs_all, 3, dim=0)
+        
+        # 3. Post-Processing (Project & Attention)
+        
+        # Q Branch (No Residual)
         q = self.qk_ln(self.q_proj(probs_q)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
-        # Apply Residual
-        q = q + q_res
         
-        # K Branch
-        qdev_k = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        qdev_k.states = common_states_reshaped.clone()
-        self._apply_pqc(qdev_k, self.k_w, x_reupload=reupload_angles)
-        for i in range(self.N_QUBITS):
-            tqf.u3(qdev_k, wires=i, params=self.meas_k_w[i].unsqueeze(0))
-        probs_k = self._measure_multibasis(qdev_k)
+        # K Branch (No Residual)
         k = self.qk_ln(self.k_proj(probs_k)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
-        # Apply Residual
-        k = k + k_res
         
-        # V Branch
-        qdev_v = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
-        qdev_v.states = common_states_reshaped.clone()
-        self._apply_pqc(qdev_v, self.v_w, x_reupload=reupload_angles)
-        for i in range(self.N_QUBITS):
-            tqf.u3(qdev_v, wires=i, params=self.meas_v_w[i].unsqueeze(0))
-        probs_v = self._measure_probs(qdev_v)
+        # V Branch (No Residual)
         v = self.v_proj(probs_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
-        # Apply Residual
-        v = v + v_res
 
         # 3. Attention
         # Optimized: Use Learnable Head-wise Scale
@@ -503,6 +617,271 @@ class QuantumAttentionAngle(QuantumAttention64):
         
         return x_out
 
+
+class QuantumAttentionAngleDense(QuantumAttentionAngle):
+    """
+    Dense Angle Encoding version of Quantum Attention.
+    Splits the 64-dim input into chunks and injects them layer-by-layer (Dense Encoding).
+    Features:
+    - Input Slicing: 64 features -> Split into N_LAYERS chunks
+    - Dense Injection: Each PQC layer receives a fresh chunk of data via Rx/Ry rotations
+    - Enhanced Capacity: Utilizes circuit depth to encode more information
+    """
+    def __init__(self, *args, use_grouped_linear=True, chunk_size=2048, use_checkpoint=True, **kwargs):
+        self.use_grouped_linear = use_grouped_linear
+        self.chunk_size = chunk_size
+        self.use_checkpoint = use_checkpoint
+        super().__init__(*args, **kwargs)
+        # print("DEBUG: QuantumAttentionAngleDense instantiated!")
+        
+        # Determine number of chunks based on depth and qubits
+        # We want to inject data at multiple layers. 
+        # Strategy: Inject every layer (or every K layers).
+        # For Q_DEPTH=4, we can inject at layers 0, 1, 2, 3.
+        # Max capacity = N_QUBITS * 2 (params) * Q_DEPTH
+        
+        # [Optimized] Dense Angle Projection (Classic Parameter Reduction)
+        # Replaced MLP (Linear->GELU->Linear) with Single Linear Projection
+        # Reducing redundant classical params while keeping quantum capacity
+        self.dense_angle_proj = nn.Linear(self.in_channels, self.Q_DEPTH * self.N_QUBITS * 2)
+        
+        # Re-initialize
+        nn.init.xavier_uniform_(self.dense_angle_proj.weight)
+        nn.init.zeros_(self.dense_angle_proj.bias)
+        
+        # [Optimized] Q/K/V/Out Projections (Grouped Linear vs Standard)
+        if self.use_grouped_linear:
+            # Use groups=2 to halve parameters for these classical mappings
+            self.q_proj = GroupedLinear(self.input_dim, self.inner_dim, groups=2)
+            self.k_proj = GroupedLinear(self.input_dim, self.inner_dim, groups=2)
+            self.v_proj = GroupedLinear(self.input_dim, self.inner_dim, groups=2)
+            self.out_proj = GroupedLinear(self.inner_dim, self.in_channels, groups=2)
+        else:
+            # Standard Linear (Ablation Baseline)
+            self.q_proj = nn.Linear(self.input_dim, self.inner_dim)
+            self.k_proj = nn.Linear(self.input_dim, self.inner_dim)
+            self.v_proj = nn.Linear(self.input_dim, self.inner_dim)
+            self.out_proj = nn.Linear(self.inner_dim, self.in_channels)
+        
+        # Zero-Init Output (for conv layer inside GroupedLinear or standard Linear)
+        if hasattr(self.out_proj, 'conv'):
+            nn.init.zeros_(self.out_proj.conv.weight)
+            nn.init.zeros_(self.out_proj.conv.bias)
+        else:
+            nn.init.zeros_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
+        
+        # Disable standard angle_proj from parent to save params (optional, but cleaner)
+        self.angle_proj = None
+
+        # [Optimized] Remove unused inp_proj from parent
+        self.inp_proj = None
+        
+        # [Optimized] Disable Classical Residuals by default to ensure fair comparison
+        # User Feedback: "Baseline parameters should be more than Quantum model."
+        # Removing these 3 projections saves ~12k parameters.
+        self.q_res_proj = None
+        self.k_res_proj = None
+        self.v_res_proj = None
+
+    def _process_qkv_chunk(self, common_states_chunk, reupload_angles_chunk, device_name):
+        """
+        Process a single chunk of Q/K/V generation on the quantum device.
+        Designed to be used with torch.utils.checkpoint.
+        """
+        bsz_chunk = common_states_chunk.shape[0]
+        actual_qdev_bsz = 3 * bsz_chunk
+        
+        # [Optimization] Device Reuse
+        qdev_all = None
+        if self.reuse_device and self._qdev_cached is not None and self._qdev_cached_bsz == actual_qdev_bsz:
+             qdev_all = self._qdev_cached
+             # We will overwrite states anyway, so just ensure bsz matches
+        else:
+             qdev_all = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=actual_qdev_bsz, device=device_name)
+             if self.reuse_device:
+                 self._qdev_cached = qdev_all
+                 self._qdev_cached_bsz = actual_qdev_bsz
+        
+        # Prepare Batch: [Q_chunk, K_chunk, V_chunk]
+        # common_states_chunk: [bsz_chunk, 2^N_QUBITS] -> [3*bsz_chunk, 2, 2, ...]
+        
+        common_states_3x = common_states_chunk.repeat(3, 1)
+        target_shape_3x = [3 * bsz_chunk] + [2] * self.N_QUBITS
+        common_states_all = common_states_3x.reshape(target_shape_3x)
+        
+        # Assign states directly
+        qdev_all.states = common_states_all.clone()
+        
+        # Apply Batched PQC
+        self._apply_pqc_batched(qdev_all, self.q_w, self.k_w, self.v_w, bsz_chunk, x_reupload=reupload_angles_chunk)
+        
+        # Apply Batched Measurement Basis
+        for i in range(self.N_QUBITS):
+            # Construct params for u3
+            p_q = self.meas_q_w[i].unsqueeze(0).expand(bsz_chunk, -1)
+            p_k = self.meas_k_w[i].unsqueeze(0).expand(bsz_chunk, -1)
+            p_v = self.meas_v_w[i].unsqueeze(0).expand(bsz_chunk, -1)
+            p_all = torch.cat([p_q, p_k, p_v], dim=0)
+            tqf.u3(qdev_all, wires=i, params=p_all)
+            
+        # Unified Measurement
+        probs_all = self._measure_multibasis(qdev_all) # [3*bsz_chunk, 64]
+        
+        # Split results
+        probs_q, probs_k, probs_v = torch.chunk(probs_all, 3, dim=0)
+        return probs_q, probs_k, probs_v
+
+    def _forward_impl(self, x_64: torch.Tensor, device_name: str) -> torch.Tensor:
+        # 1. Prepare common state via Dense Angle Encoding
+        B, S, D = x_64.shape
+        bsz = B * S
+        x_bsz = x_64.reshape(bsz, D)
+        
+        # Note: We work directly with input features (D = in_channels)
+        # inp_proj is skipped as we use Dense Angle Encoding directly on inputs
+        
+        # Calculate Classical Residuals (Hybrid-Residual Architecture)
+        # [Optimized] Disabled for Parameter Efficiency
+        if self.q_res_proj is not None:
+            q_res = self.q_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+            k_res = self.k_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+            v_res = self.v_res_proj(x_bsz).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        else:
+            q_res = 0
+            k_res = 0
+            v_res = 0
+        
+        # Dense Angle Encoding: D -> Q_DEPTH * N_QUBITS * 2
+        raw_out = self.dense_angle_proj(x_bsz)
+        # Shape: [bsz, Q_DEPTH, N_QUBITS, 2]
+        # Improved Mapping: Center around 0 (Identity) instead of pi/2
+        # Range: [-pi, pi]
+        angles = torch.tanh(raw_out) * torch.pi
+        angles = angles.reshape(bsz, self.Q_DEPTH, self.N_QUBITS, 2)
+        
+        rx_angles = angles[:, :, :, 0] # [bsz, depth, n_qubits]
+        ry_angles = angles[:, :, :, 1] # [bsz, depth, n_qubits]
+
+        # Create common device (starts at |0>)
+        # Optimization: Device Reuse
+        qdev_common = None
+        if self.reuse_device and self._qdev_common_cached is not None and self._qdev_common_cached_bsz == bsz:
+             qdev_common = self._qdev_common_cached
+             if hasattr(qdev_common, 'reset_states'):
+                 qdev_common.reset_states(bsz=bsz)
+             else:
+                 qdev_common = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+        else:
+             qdev_common = tq.QuantumDevice(n_wires=self.N_QUBITS, bsz=bsz, device=device_name)
+             if self.reuse_device:
+                 self._qdev_common_cached = qdev_common
+                 self._qdev_common_cached_bsz = bsz
+        
+        # Apply Dense Encoding (Layer-wise injection)
+        # enc_w shape: [Q_DEPTH, N_QUBITS, 3]
+        for d in range(self.Q_DEPTH):
+            # 1. Data Injection (Rx, Ry)
+            for i in range(self.N_QUBITS):
+                tqf.rx(qdev_common, wires=i, params=rx_angles[:, d, i])
+                tqf.ry(qdev_common, wires=i, params=ry_angles[:, d, i])
+            
+            # 2. Trainable Unitary (PQC Layer)
+            # Apply rotations from enc_w[d]
+            for i in range(self.N_QUBITS):
+                tqf.u3(qdev_common, wires=i, params=self.enc_w[d, i].unsqueeze(0))
+            
+            # 3. Entanglement (CNOT Ring)
+            for i in range(self.N_QUBITS):
+                tqf.cnot(qdev_common, wires=[i, (i + 1) % self.N_QUBITS])
+            
+        # Get common state (Flattened)
+        if hasattr(qdev_common, 'get_states_1d'): 
+            common_states_flat = qdev_common.get_states_1d()
+        else: 
+            common_states_flat = qdev_common.states.reshape(bsz, -1)
+        
+        # Data Re-uploading for branches (Standard 64->6 reupload)
+        # Note: We could use Dense here too, but let's keep branches lightweight
+        reupload_angles = torch.tanh(self.reupload_proj(x_bsz)) * torch.pi
+
+        # 2. Fork to Q/K/V branches (Optimized Batch-Parallel with Chunking)
+        q_list, k_list, v_list = [], [], []
+        
+        # Checkpoint-friendly Loop
+        for i in range(0, bsz, self.chunk_size):
+            end = min(i + self.chunk_size, bsz)
+            chunk_states = common_states_flat[i:end]
+            chunk_reupload = reupload_angles[i:end]
+            
+            if self.use_checkpoint and self.training:
+                 # Checkpointing saves memory by re-computing forward pass during backward
+                 chunk_q, chunk_k, chunk_v = checkpoint_utils.checkpoint(
+                     self._process_qkv_chunk,
+                     chunk_states,
+                     chunk_reupload,
+                     device_name,
+                     use_reentrant=False
+                 )
+            else:
+                 chunk_q, chunk_k, chunk_v = self._process_qkv_chunk(
+                     chunk_states, 
+                     chunk_reupload, 
+                     device_name
+                 )
+            
+            q_list.append(chunk_q)
+            k_list.append(chunk_k)
+            v_list.append(chunk_v)
+            
+        probs_q = torch.cat(q_list, dim=0)
+        probs_k = torch.cat(k_list, dim=0)
+        probs_v = torch.cat(v_list, dim=0)
+        
+        # 3. Projections (Batched execution results)
+        q = self.qk_ln(self.q_proj(probs_q)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        q = q + q_res
+        
+        k = self.qk_ln(self.k_proj(probs_k)).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        k = k + k_res
+        
+        v = self.v_proj(probs_v).reshape(B, S, self.num_heads, self.qk_dim).permute(0, 2, 1, 3)
+        v = v + v_res
+        
+        # 3. Attention Mechanism (Standard)
+        # Manually implement attention logic since we can't easily call _attention_core from parent if it's not exposed
+        # Actually _attention_core is not defined in QuantumAttentionAngle, it's just logic inside forward.
+        # Let's copy the attention logic.
+        
+        # Optimized: Use Learnable Head-wise Scale
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.attn_scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        x_out = (attn @ v).transpose(1, 2).reshape(B, S, self.inner_dim)
+        x_out = self.out_proj(x_out)
+        
+        return x_out
+
+class QSANN_Angle_Dense_Pure(QuantumAttentionAngleDense):
+    """
+    Pure Quantum version of Dense Angle Encoding (No Classical Residuals).
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Re-initialize Output Projection (Crucial for Pure Quantum)
+        # Since we removed the classical residual path, we cannot start with zero output.
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+
+        # Disable Classical Residuals
+        for proj in [self.q_res_proj, self.k_res_proj, self.v_res_proj]:
+            nn.init.zeros_(proj.weight)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
+            proj.weight.requires_grad = False
+            if proj.bias is not None:
+                proj.bias.requires_grad = False
 
 class QuantumAttentionPatch(nn.Module):
     """
@@ -1386,6 +1765,255 @@ class QuantumAdaGN(nn.Module):
                     tqf.rz(qdev, wires=i, params=sub_da[:, i])
 
     # @torch.jit.script # TQ functional calls are not scriptable due to global dict lookups
+    def _fast_ry_layer(self, qdev, params):
+        # params: [B, N]
+        # Construct and apply full layer unitary
+        bsz = params.shape[0]
+        n_qubits = params.shape[1]
+        dim = 2 ** n_qubits
+        
+        # 1. Construct Rot Matrices [B, N, 2, 2]
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        # [B, N, 2, 2]
+        mats = torch.stack([
+            torch.stack([c, -s], dim=-1),
+            torch.stack([s, c], dim=-1)
+        ], dim=-2).to(qdev.states.dtype)
+        
+        # 2. Batch Kron
+        # Start with [B, 2, 2]
+        res = mats[:, 0]
+        for i in range(1, n_qubits):
+            # einsum: bik, bjl -> bijkl -> reshape
+            # [B, dim_curr, dim_curr] x [B, 2, 2]
+            res = torch.einsum('bik,bjl->bijkl', res, mats[:, i])
+            new_dim = res.shape[1] * 2
+            res = res.reshape(bsz, new_dim, new_dim)
+                
+            # 3. Apply
+        # qdev.states: [B, 2, 2...]
+        # Handle potential ancilla qubits (extra dimensions)
+        original_shape = qdev.states.shape
+        flat_states = qdev.states.reshape(bsz, dim, -1)
+        new_states = torch.bmm(res, flat_states)
+        qdev.states = new_states.reshape(original_shape)
+
+    def _fast_rz_layer(self, qdev, params):
+        # params: [B, N]
+        # Diagonal fusion
+        bsz = params.shape[0]
+        n_qubits = params.shape[1]
+        dim = 2 ** n_qubits
+        device = params.device
+        
+        # Precompute signs if not cached
+        cache_key = (n_qubits, device)
+        if not hasattr(self, '_rz_signs_cache') or self._rz_signs_cache_key != cache_key:
+            arange = torch.arange(dim, device=device)
+            # bits: [dim, n] - extract bits. Wire 0 is MSB or LSB?
+            # TQ uses standard tensor product order: q0 (x) q1 ...
+            # So index 0..2^N-1.
+            # q0 is MSB (stride 2^(N-1))
+            # bits: [dim, n]
+            # (arange >> shift) & 1
+            shifts = torch.arange(n_qubits - 1, -1, -1, device=device)
+            bits = (arange.unsqueeze(1) >> shifts) & 1
+            # 0 -> -0.5, 1 -> 0.5
+            # exp(-i * theta/2) for 0
+            # exp(i * theta/2) for 1
+            # coeff: if 0 -> -0.5, if 1 -> 0.5
+            signs = (bits.float() - 0.5) 
+            self._rz_signs_cache = signs
+            self._rz_signs_cache_key = cache_key
+        
+        signs = self._rz_signs_cache # [dim, n]
+        
+        # phases: [B, dim]
+        # sum_j (signs[k, j] * params[b, j])
+        phases = torch.matmul(params, signs.T)
+        
+        # rot: exp(i * phases)
+        rot_diag = torch.complex(torch.cos(phases), torch.sin(phases))
+        
+        # Apply
+        original_shape = qdev.states.shape
+        flat_states = qdev.states.reshape(bsz, dim, -1)
+        rot_diag_expanded = rot_diag.unsqueeze(2)
+        flat_states = flat_states * rot_diag_expanded
+        qdev.states = flat_states.reshape(original_shape)
+
+    def _fast_cnot_layer(self, qdev, n_qubits, use_strided):
+        # Permutation fusion
+        bsz = qdev.bsz
+        dim = 2 ** n_qubits
+        device = qdev.states.device
+        
+        cache_key = (n_qubits, use_strided, device)
+        if not hasattr(self, '_cnot_perm_cache') or self._cnot_perm_cache_key != cache_key:
+            # Construct permutation
+            # Apply CNOTs to basis states indices
+            indices = torch.arange(dim, device=device)
+            
+            # Helper to flip bit
+            def flip_bit(inds, target):
+                # target is 0..N-1 (0 is MSB)
+                # bit mask: 1 << (N - 1 - target)
+                mask = 1 << (n_qubits - 1 - target)
+                return inds ^ mask
+                
+            # Helper to check control
+            def check_bit(inds, control):
+                mask = 1 << (n_qubits - 1 - control)
+                return (inds & mask) != 0
+            
+            # Apply ring CNOTs
+            for i in range(n_qubits):
+                ctl = i
+                tgt = (i + 1) % n_qubits
+                # If bit ctl is 1, flip tgt
+                mask_ctl = 1 << (n_qubits - 1 - ctl)
+                mask_tgt = 1 << (n_qubits - 1 - tgt)
+                
+                # Where ctl is 1
+                should_flip = (indices & mask_ctl) != 0
+                # Flip tgt where should_flip
+                indices = torch.where(should_flip, indices ^ mask_tgt, indices)
+                
+            if use_strided and n_qubits >= 4:
+                for i in range(n_qubits):
+                    ctl = i
+                    tgt = (i + 2) % n_qubits
+                    mask_ctl = 1 << (n_qubits - 1 - ctl)
+                    mask_tgt = 1 << (n_qubits - 1 - tgt)
+                    should_flip = (indices & mask_ctl) != 0
+                    indices = torch.where(should_flip, indices ^ mask_tgt, indices)
+            
+            self._cnot_perm_cache = torch.argsort(indices)
+            self._cnot_perm_cache_key = cache_key
+            
+        perm = self._cnot_perm_cache
+        
+        # Apply permutation
+        # [B, dim]
+        flat_states = qdev.states.reshape(bsz, dim)
+        flat_states = flat_states[:, perm]
+        qdev.states = flat_states.reshape([bsz] + [2]*n_qubits)
+
+    def _fast_ry(self, qdev, wires, params):
+        # params: [B]
+        if apply_unitary_bmm is None:
+            tqf.ry(qdev, wires=wires, params=params)
+            return
+            
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        # [B, 2, 2]
+        matrix = torch.stack([
+            torch.stack([c, -s], dim=1),
+            torch.stack([s, c], dim=1)
+        ], dim=1).to(qdev.states.dtype)
+        
+        qdev.states = apply_unitary_bmm(qdev.states, matrix, [wires] if isinstance(wires, int) else wires)
+
+    def _fast_rz(self, qdev, wires, params):
+        if apply_unitary_bmm is None:
+            tqf.rz(qdev, wires=wires, params=params)
+            return
+            
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        e_neg = torch.complex(c, -s)
+        e_pos = torch.complex(c, s)
+        
+        matrix = torch.stack([
+            torch.stack([e_neg, torch.zeros_like(e_neg)], dim=1),
+            torch.stack([torch.zeros_like(e_pos), e_pos], dim=1)
+        ], dim=1).to(qdev.states.dtype)
+        
+        qdev.states = apply_unitary_bmm(qdev.states, matrix, [wires] if isinstance(wires, int) else wires)
+
+    def _fast_cnot(self, qdev, wires):
+        if apply_unitary_bmm is None:
+            tqf.cnot(qdev, wires=wires)
+            return
+            
+        if not hasattr(self, '_cnot_mat') or self._cnot_mat.device != qdev.states.device:
+             m = torch.tensor([[1,0,0,0], [0,1,0,0], [0,0,0,1], [0,0,1,0]], dtype=qdev.states.dtype, device=qdev.states.device)
+             self._cnot_mat = m
+             
+        qdev.states = apply_unitary_bmm(qdev.states, self._cnot_mat, wires)
+
+    def _fast_crx(self, qdev, wires, params):
+        if apply_unitary_bmm is None:
+            tqf.crx(qdev, wires=wires, params=params)
+            return
+
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        
+        # CRX = diag(I, RX(theta))
+        # RX = [[c, -is], [-is, c]]
+        # top left I: [[1, 0], [0, 1]]
+        # [B, 4, 4]
+        
+        bsz = theta.shape[0]
+        zeros = torch.zeros_like(c)
+        ones = torch.ones_like(c)
+        
+        # Construct via stacking
+        # Row 0: 1, 0, 0, 0
+        # Row 1: 0, 1, 0, 0
+        # Row 2: 0, 0, c, -is
+        # Row 3: 0, 0, -is, c
+        
+        # complex -is
+        neg_is = torch.complex(zeros, -s)
+        c_complex = torch.complex(c, zeros)
+        one_complex = torch.complex(ones, zeros)
+        zero_complex = torch.complex(zeros, zeros)
+        
+        matrix = torch.stack([
+            torch.stack([one_complex, zero_complex, zero_complex, zero_complex], dim=1),
+            torch.stack([zero_complex, one_complex, zero_complex, zero_complex], dim=1),
+            torch.stack([zero_complex, zero_complex, c_complex, neg_is], dim=1),
+            torch.stack([zero_complex, zero_complex, neg_is, c_complex], dim=1)
+        ], dim=1).to(qdev.states.dtype)
+        
+        qdev.states = apply_unitary_bmm(qdev.states, matrix, wires)
+
+    def _fast_crz(self, qdev, wires, params):
+        if apply_unitary_bmm is None:
+            tqf.crz(qdev, wires=wires, params=params)
+            return
+            
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        e_neg = torch.complex(c, -s)
+        e_pos = torch.complex(c, s)
+        
+        # CRZ = diag(1, 1, e_neg, e_pos)
+        
+        bsz = theta.shape[0]
+        zeros = torch.zeros_like(c)
+        ones = torch.ones_like(c)
+        one_complex = torch.complex(ones, zeros)
+        zero_complex = torch.complex(zeros, zeros)
+        
+        matrix = torch.stack([
+            torch.stack([one_complex, zero_complex, zero_complex, zero_complex], dim=1),
+            torch.stack([zero_complex, one_complex, zero_complex, zero_complex], dim=1),
+            torch.stack([zero_complex, zero_complex, e_neg, zero_complex], dim=1),
+            torch.stack([zero_complex, zero_complex, zero_complex, e_pos], dim=1)
+        ], dim=1).to(qdev.states.dtype)
+        
+        qdev.states = apply_unitary_bmm(qdev.states, matrix, wires)
+
     def _apply_fusion_circuit(self, qdev, sub_bsz, sub_da, sub_sa, interaction_wires, data_wires, 
                               mod_params, qcnn_rot_params, 
                               n_qubits_data: int, n_qubits_ancilla: int, active_layers: int, 
@@ -1422,6 +2050,128 @@ class QuantumAdaGN(nn.Module):
                 for i in range(n_qubits_data):
                     # Internal Time Embedding: Re-upload both Data and Style at each layer
                     tqf.rz(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
+
+    def _batch_kron(self, mat_list, sub_bsz):
+        res = mat_list[0]
+        for m in mat_list[1:]:
+            res = torch.einsum('bik,bjl->bijkl', res, m).reshape(sub_bsz, res.shape[1]*m.shape[1], res.shape[2]*m.shape[2])
+        return res
+
+    def _fast_batch_rot_layer(self, qdev, n_qubits, ry_params, rz_params, sub_bsz):
+        # ry_params, rz_params: [B, N]
+        if n_qubits > 8: # Fallback for large systems
+            for i in range(n_qubits):
+                self._fast_ry(qdev, i, ry_params[:, i])
+                self._fast_rz(qdev, i, rz_params[:, i])
+            return
+
+        mats = []
+        dtype = qdev.states.dtype
+        device = qdev.states.device
+        
+        for i in range(n_qubits):
+            # RY
+            theta = ry_params[:, i]
+            c = torch.cos(theta / 2)
+            s = torch.sin(theta / 2)
+            m_ry = torch.stack([torch.stack([c, -s], 1), torch.stack([s, c], 1)], 1).to(dtype)
+            
+            # RZ
+            theta = rz_params[:, i]
+            c = torch.cos(theta / 2)
+            s = torch.sin(theta / 2)
+            e_neg = torch.complex(c, -s)
+            e_pos = torch.complex(c, s)
+            z = torch.zeros_like(c)
+            m_rz = torch.stack([torch.stack([e_neg, z], 1), torch.stack([z, e_pos], 1)], 1).to(dtype)
+            
+            mats.append(torch.bmm(m_rz, m_ry))
+            
+        full_op = self._batch_kron(mats, sub_bsz)
+        qdev.states = apply_unitary_bmm(qdev.states, full_op, list(range(n_qubits)))
+
+    def _fast_batch_cnot_layer(self, qdev, n_qubits, stride, sub_bsz):
+        if n_qubits > 8:
+            for i in range(n_qubits):
+                self._fast_cnot(qdev, wires=[i, (i + stride) % n_qubits])
+            return
+            
+        # Group disjoint pairs
+        # Simple greedy grouping
+        pairs = [(i, (i + stride) % n_qubits) for i in range(n_qubits)]
+        
+        # Split into layers where no qubit is used twice
+        layers = []
+        while pairs:
+            current_layer = []
+            used_qubits = set()
+            remaining_pairs = []
+            for u, v in pairs:
+                if u not in used_qubits and v not in used_qubits:
+                    current_layer.append((u, v))
+                    used_qubits.add(u)
+                    used_qubits.add(v)
+                else:
+                    remaining_pairs.append((u, v))
+            layers.append(current_layer)
+            pairs = remaining_pairs
+            
+        # Apply each layer
+        dtype = qdev.states.dtype
+        device = qdev.states.device
+        
+        # CNOT matrix
+        cnot_mat = torch.tensor([[1,0,0,0], [0,1,0,0], [0,0,0,1], [0,0,1,0]], dtype=dtype, device=device)
+        cnot_mat = cnot_mat.unsqueeze(0).expand(sub_bsz, -1, -1)
+        
+        # Identity matrix
+        eye_mat = torch.eye(2, dtype=dtype, device=device).unsqueeze(0).expand(sub_bsz, -1, -1)
+        
+        for layer_pairs in layers:
+            # Construct full operator for this layer
+            # Map qubit -> op
+            qubit_ops = {}
+            for u, v in layer_pairs:
+                qubit_ops[u] = ('cnot_ctl', v)
+                qubit_ops[v] = ('cnot_tgt', u)
+            
+            # Iterate 0..N-1
+            mats = []
+            i = 0
+            while i < n_qubits:
+                if i in qubit_ops:
+                    op_type, other = qubit_ops[i]
+                    if op_type == 'cnot_ctl':
+                        # Found a pair (i, other)
+                        # Depending on order, might need SWAP logic if we construct linearly
+                        # BUT batch_kron assumes order 0, 1, 2...
+                        # If pair is (i, i+1), we append CNOT.
+                        # If pair is (i, i+k), we can't easily use batch_kron unless they are adjacent in list?
+                        # Wait, batch_kron constructs Tensor Product M0 (x) M1 ...
+                        # This corresponds to applying M0 on wire 0, M1 on wire 1...
+                        # CNOT(0, 2) CANNOT be represented as M0 (x) M1 (x) M2 directly if wires are permuted?
+                        # Actually, if we use apply_unitary_bmm with wires=[0...N], the matrix MUST represent the operator on those wires.
+                        # Operator on 0,1,2: CNOT(0,2) (x) I(1).
+                        # This is NOT CNOT (x) I. It involves permutation.
+                        # SWAP gates are needed to bring them adjacent.
+                        
+                        # So fusion of non-adjacent CNOTs into a single large matrix is TRICKY.
+                        # We need to construct the matrix elements.
+                        pass
+                    pass
+                i += 1
+                
+        # Actually, simpler approach for CNOTs:
+        # Just use sequential application for now, OR only fuse adjacent CNOTs.
+        # Ring CNOTs: (0,1), (1,2)... are adjacent.
+        # (N-1, 0) is not.
+        
+        # Let's fallback to sequential for CNOTs for now to avoid bugs, 
+        # but optimize the RY/RZ part which is 2/3 of the operations.
+        # The RY/RZ part is strictly local (1-qubit), so fusion is trivial.
+        
+        for i in range(n_qubits):
+             self._fast_cnot(qdev, wires=[i, (i + stride) % n_qubits])
 
     # @torch.jit.script # TQ functional calls are not scriptable due to global dict lookups
     def _apply_fusion_circuit(self, qdev, sub_bsz, sub_da, sub_sa, interaction_wires, data_wires, 
@@ -1489,10 +2239,22 @@ class QuantumAdaGN(nn.Module):
                 for i in range(n_qubits_data):
                     tqf.cnot(qdev, wires=[i, (i + 2) % n_qubits_data])
             if reupload_data and (l < active_layers - 1):
+                # [SOTA Update] Frequency Modulation Re-uploading (Q-Middle-Freq)
+                # At the middle layer, we use multiplicative scaling for effective noise intensity modulation.
+                middle_layer = active_layers // 2
+                is_middle_reupload = (l == middle_layer)
+                
                 for i in range(n_qubits_data):
                     # Fusion Re-uploading
                     if sub_sa is not None:
-                        tqf.rz(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
+                        if is_middle_reupload:
+                            # Multiplicative Scaling: Data * (1 + Style)
+                            # Simulates Frequency Modulation (Scale) rather than Phase Shift (Shift)
+                            reup_params = sub_da[:, i] * (1.0 + sub_sa[:, i])
+                            tqf.rz(qdev, wires=i, params=reup_params)
+                        else:
+                            # Standard Additive for other layers
+                            tqf.rz(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
                     else:
                         tqf.rz(qdev, wires=i, params=sub_da[:, i])
 
@@ -1674,17 +2436,342 @@ class QuantumFrontEndQCNN(nn.Module):
       - Classical Residual Connection
     """
     # @torch.jit.script # TQ functional calls are not scriptable due to global dict lookups
+    def _fast_ry(self, qdev, wires, params):
+        # params: [B]
+        if apply_unitary_bmm is None:
+            tqf.ry(qdev, wires=wires, params=params)
+            return
+            
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        # [B, 2, 2]
+        matrix = torch.stack([
+            torch.stack([c, -s], dim=1),
+            torch.stack([s, c], dim=1)
+        ], dim=1).to(qdev.states.dtype)
+        
+        qdev.states = apply_unitary_bmm(qdev.states, matrix, [wires] if isinstance(wires, int) else wires)
+
+    def _fast_rz(self, qdev, wires, params):
+        if apply_unitary_bmm is None:
+            tqf.rz(qdev, wires=wires, params=params)
+            return
+            
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        e_neg = torch.complex(c, -s)
+        e_pos = torch.complex(c, s)
+        
+        matrix = torch.stack([
+            torch.stack([e_neg, torch.zeros_like(e_neg)], dim=1),
+            torch.stack([torch.zeros_like(e_pos), e_pos], dim=1)
+        ], dim=1).to(qdev.states.dtype)
+        
+        qdev.states = apply_unitary_bmm(qdev.states, matrix, [wires] if isinstance(wires, int) else wires)
+
+    def _fast_cnot(self, qdev, wires):
+        if apply_unitary_bmm is None:
+            tqf.cnot(qdev, wires=wires)
+            return
+            
+        if not hasattr(self, '_cnot_mat') or self._cnot_mat.device != qdev.states.device:
+             m = torch.tensor([[1,0,0,0], [0,1,0,0], [0,0,0,1], [0,0,1,0]], dtype=qdev.states.dtype, device=qdev.states.device)
+             self._cnot_mat = m
+             
+        qdev.states = apply_unitary_bmm(qdev.states, self._cnot_mat, wires)
+
+    def _fast_crx(self, qdev, wires, params):
+        if apply_unitary_bmm is None:
+            tqf.crx(qdev, wires=wires, params=params)
+            return
+
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        
+        # CRX = diag(I, RX(theta))
+        # RX = [[c, -is], [-is, c]]
+        # top left I: [[1, 0], [0, 1]]
+        # [B, 4, 4]
+        
+        bsz = theta.shape[0]
+        zeros = torch.zeros_like(c)
+        ones = torch.ones_like(c)
+        
+        # Construct via stacking
+        # Row 0: 1, 0, 0, 0
+        # Row 1: 0, 1, 0, 0
+        # Row 2: 0, 0, c, -is
+        # Row 3: 0, 0, -is, c
+        
+        # complex -is
+        neg_is = torch.complex(zeros, -s)
+        c_complex = torch.complex(c, zeros)
+        one_complex = torch.complex(ones, zeros)
+        zero_complex = torch.complex(zeros, zeros)
+        
+        matrix = torch.stack([
+            torch.stack([one_complex, zero_complex, zero_complex, zero_complex], dim=1),
+            torch.stack([zero_complex, one_complex, zero_complex, zero_complex], dim=1),
+            torch.stack([zero_complex, zero_complex, c_complex, neg_is], dim=1),
+            torch.stack([zero_complex, zero_complex, neg_is, c_complex], dim=1)
+        ], dim=1).to(qdev.states.dtype)
+        
+        qdev.states = apply_unitary_bmm(qdev.states, matrix, wires)
+
+    def _fast_crz(self, qdev, wires, params):
+        if apply_unitary_bmm is None:
+            tqf.crz(qdev, wires=wires, params=params)
+            return
+            
+        theta = params
+        c = torch.cos(theta / 2)
+        s = torch.sin(theta / 2)
+        e_neg = torch.complex(c, -s)
+        e_pos = torch.complex(c, s)
+        
+        # CRZ = diag(1, 1, e_neg, e_pos)
+        
+        bsz = theta.shape[0]
+        zeros = torch.zeros_like(c)
+        ones = torch.ones_like(c)
+        one_complex = torch.complex(ones, zeros)
+        zero_complex = torch.complex(zeros, zeros)
+        
+        matrix = torch.stack([
+            torch.stack([one_complex, zero_complex, zero_complex, zero_complex], dim=1),
+            torch.stack([zero_complex, one_complex, zero_complex, zero_complex], dim=1),
+            torch.stack([zero_complex, zero_complex, e_neg, zero_complex], dim=1),
+            torch.stack([zero_complex, zero_complex, zero_complex, e_pos], dim=1)
+        ], dim=1).to(qdev.states.dtype)
+        
+        qdev.states = apply_unitary_bmm(qdev.states, matrix, wires)
+
+    def _batch_kron(self, mat_list, sub_bsz):
+        res = mat_list[0]
+        for m in mat_list[1:]:
+            res = torch.einsum('bik,bjl->bijkl', res, m).reshape(sub_bsz, res.shape[1]*m.shape[1], res.shape[2]*m.shape[2])
+        return res
+
+    def _get_batch_rot_matrix(self, n_qubits, ry_params, rz_params, sub_bsz, device, dtype):
+        mats = []
+        for i in range(n_qubits):
+            # RY
+            theta = ry_params[:, i]
+            c = torch.cos(theta / 2)
+            s = torch.sin(theta / 2)
+            m_ry = torch.stack([torch.stack([c, -s], 1), torch.stack([s, c], 1)], 1).to(dtype)
+            
+            # RZ
+            theta = rz_params[:, i]
+            c = torch.cos(theta / 2)
+            s = torch.sin(theta / 2)
+            e_neg = torch.complex(c, -s)
+            e_pos = torch.complex(c, s)
+            z = torch.zeros_like(c)
+            m_rz = torch.stack([torch.stack([e_neg, z], 1), torch.stack([z, e_pos], 1)], 1).to(dtype)
+            
+            mats.append(torch.bmm(m_rz, m_ry))
+            
+        return self._batch_kron(mats, sub_bsz)
+
+    def _get_cnot_layer_matrix(self, n_qubits, use_strided, device, dtype):
+        # Check cache
+        cache_key = (n_qubits, use_strided, device, dtype)
+        if hasattr(self, '_cnot_layer_cache') and self._cnot_layer_cache.get('key') == cache_key:
+            return self._cnot_layer_cache['mat']
+        
+        dim = 2 ** n_qubits
+        # Apply U to Identity to get U^T (columns of U)
+        state = torch.eye(dim, device=device, dtype=dtype).reshape([dim] + [2]*n_qubits)
+        cnot_mat_2q = torch.tensor([[1,0,0,0], [0,1,0,0], [0,0,0,1], [0,0,1,0]], dtype=dtype, device=device)
+        
+        for i in range(n_qubits):
+            wires = [i, (i + 1) % n_qubits]
+            state = apply_unitary_bmm(state, cnot_mat_2q, wires)
+            
+        if use_strided and n_qubits >= 4:
+            for i in range(n_qubits):
+                wires = [i, (i + 2) % n_qubits]
+                state = apply_unitary_bmm(state, cnot_mat_2q, wires)
+        
+        # Transpose to get U
+        mat = state.reshape(dim, dim).T
+        self._cnot_layer_cache = {'key': cache_key, 'mat': mat}
+        return mat
+
+    def _fast_ry_layer(self, qdev, params):
+        # params: [B, N]
+        # Sequential application using apply_unitary_bmm for efficiency
+        # Benchmarks show sequential (2.5ms) is ~5x faster than full matrix fusion (12.7ms) for N=6
+        import math
+        bsz = params.shape[0]
+        n_qubits = params.shape[1]
+        
+        # Ensure states are in tensor form [B, 2, 2, ..., 2] for apply_unitary_bmm
+        original_shape = qdev.states.shape
+        
+        # Reshape to tensor form if needed
+        if qdev.states.ndim == 2:
+            # [B, dim_total]
+            n_wires_total = int(math.log2(qdev.states.shape[1]))
+            qdev.states = qdev.states.reshape([bsz] + [2] * n_wires_total)
+        elif qdev.states.ndim == 3 and qdev.states.shape[2] == 1:
+            # [B, dim_total, 1]
+            n_wires_total = int(math.log2(qdev.states.shape[1]))
+            qdev.states = qdev.states.reshape([bsz] + [2] * n_wires_total)
+            
+        for i in range(n_qubits):
+            theta = params[:, i]
+            c = torch.cos(theta / 2)
+            s = torch.sin(theta / 2)
+            # Matrix [B, 2, 2]
+            mat = torch.stack([
+                torch.stack([c, -s], dim=-1),
+                torch.stack([s, c], dim=-1)
+            ], dim=-2).to(qdev.states.dtype)
+            
+            # Apply to wire i using apply_unitary_bmm
+            qdev.states = apply_unitary_bmm(qdev.states, mat, [i])
+            
+        # Restore original shape if it was different
+        if qdev.states.shape != original_shape:
+            qdev.states = qdev.states.reshape(original_shape)
+
+    def _fast_rz_layer(self, qdev, params):
+        # params: [B, N]
+        # Diagonal fusion
+        bsz = params.shape[0]
+        n_qubits = params.shape[1]
+        dim = 2 ** n_qubits
+        device = params.device
+        
+        # Precompute signs if not cached
+        cache_key = (n_qubits, device)
+        if not hasattr(self, '_rz_signs_cache') or getattr(self, '_rz_signs_cache_key', None) != cache_key:
+            arange = torch.arange(dim, device=device)
+            shifts = torch.arange(n_qubits - 1, -1, -1, device=device)
+            bits = (arange.unsqueeze(1) >> shifts) & 1
+            signs = (bits.float() - 0.5) 
+            self._rz_signs_cache = signs
+            self._rz_signs_cache_key = cache_key
+        
+        signs = self._rz_signs_cache # [dim, n]
+        
+        # phases: [B, dim]
+        phases = torch.matmul(params, signs.T)
+        
+        # rot: exp(i * phases)
+        rot_diag = torch.complex(torch.cos(phases), torch.sin(phases))
+        
+        # Apply
+        original_shape = qdev.states.shape
+        flat_states = qdev.states.reshape(bsz, dim, -1)
+        rot_diag_expanded = rot_diag.unsqueeze(2)
+        flat_states = flat_states * rot_diag_expanded
+        qdev.states = flat_states.reshape(original_shape)
+
+    def _fast_cnot_layer(self, qdev, n_qubits, use_strided):
+        # Permutation fusion
+        bsz = qdev.bsz
+        dim = 2 ** n_qubits
+        device = qdev.states.device
+        
+        cache_key = (n_qubits, use_strided, device)
+        if not hasattr(self, '_cnot_perm_cache') or getattr(self, '_cnot_perm_cache_key', None) != cache_key:
+            indices = torch.arange(dim, device=device)
+            
+            # Apply ring CNOTs
+            for i in range(n_qubits):
+                ctl = i
+                tgt = (i + 1) % n_qubits
+                mask_ctl = 1 << (n_qubits - 1 - ctl)
+                mask_tgt = 1 << (n_qubits - 1 - tgt)
+                
+                should_flip = (indices & mask_ctl) != 0
+                indices = torch.where(should_flip, indices ^ mask_tgt, indices)
+                
+            if use_strided and n_qubits >= 4:
+                for i in range(n_qubits):
+                    ctl = i
+                    tgt = (i + 2) % n_qubits
+                    mask_ctl = 1 << (n_qubits - 1 - ctl)
+                    mask_tgt = 1 << (n_qubits - 1 - tgt)
+                    should_flip = (indices & mask_ctl) != 0
+                    indices = torch.where(should_flip, indices ^ mask_tgt, indices)
+            
+            self._cnot_perm_cache = torch.argsort(indices)
+            self._cnot_perm_cache_key = cache_key
+            
+        perm = self._cnot_perm_cache
+        
+        # Apply permutation
+        original_shape = qdev.states.shape
+        flat_states = qdev.states.reshape(bsz, dim, -1)
+        flat_states = flat_states[:, perm, :]
+        qdev.states = flat_states.reshape(original_shape)
+
+    def _get_fused_controlled_matrix(self, params_list, gate_type, device, dtype):
+        # params_list: list of tensors [B], length k
+        # gate_type: 'rx' or 'rz'
+        # Returns [B, 2^(k+1), 2^(k+1)]
+        
+        mats = []
+        bsz = params_list[0].shape[0]
+        
+        for theta in params_list:
+            c = torch.cos(theta / 2)
+            s = torch.sin(theta / 2)
+            if gate_type == 'rx':
+                # RX = [[c, -is], [-is, c]]
+                zeros = torch.zeros_like(c)
+                neg_is = torch.complex(zeros, -s)
+                c_complex = torch.complex(c, zeros)
+                m = torch.stack([torch.stack([c_complex, neg_is], 1), torch.stack([neg_is, c_complex], 1)], 1).to(dtype)
+            else: # rz
+                # RZ = [[e_neg, 0], [0, e_pos]]
+                e_neg = torch.complex(c, -s)
+                e_pos = torch.complex(c, s)
+                z = torch.zeros_like(c)
+                m = torch.stack([torch.stack([e_neg, z], 1), torch.stack([z, e_pos], 1)], 1).to(dtype)
+            mats.append(m)
+            
+        # U_targets = U1 x U2 x ...
+        u_targets = self._batch_kron(mats, bsz) # [B, 2^k, 2^k]
+        
+        # Construct Controlled Matrix: [[I, 0], [0, U_targets]]
+        dim_targets = u_targets.shape[1]
+        
+        # Identity for control=0 branch
+        eye = torch.eye(dim_targets, device=device, dtype=dtype).unsqueeze(0).expand(bsz, -1, -1)
+        zeros = torch.zeros(bsz, dim_targets, dim_targets, device=device, dtype=dtype)
+        
+        row0 = torch.cat([eye, zeros], dim=2)
+        row1 = torch.cat([zeros, u_targets], dim=2)
+        matrix = torch.cat([row0, row1], dim=1)
+        
+        return matrix
+
     def _apply_fusion_circuit(self, qdev, sub_bsz, sub_da, sub_sa, interaction_wires, data_wires, 
                               mod_params, qcnn_rot_params, 
                               n_qubits_data: int, n_qubits_ancilla: int, active_layers: int, 
                               use_strided_cnot: bool, reupload_data: bool, encoding_type: str):
-        # 2. Encode Data
+        
+        device = qdev.states.device
+        dtype = qdev.states.dtype
+
+        # 2. Encode Data (Fused)
         if encoding_type == 'amplitude':
             # Amplitude Encoding: Data is already encoded in state vector.
             # We only apply Style Modulation here (if any)
             if sub_sa is not None:
-                for i in range(n_qubits_data):
-                    tqf.ry(qdev, wires=i, params=sub_sa[:, i])
+                # Fused RY layer
+                # zeros = torch.zeros_like(sub_sa)
+                # rot_mat = self._get_batch_rot_matrix(n_qubits_data, sub_sa, zeros, sub_bsz, device, dtype)
+                # qdev.states = apply_unitary_bmm(qdev.states, rot_mat, list(range(n_qubits_data)))
+                self._fast_ry_layer(qdev, sub_sa)
         else:
             # Angle Encoding (RY)
             # Integrated Fusion: Data + Style
@@ -1692,54 +2779,98 @@ class QuantumFrontEndQCNN(nn.Module):
                  init_params = sub_da + sub_sa
             else:
                  init_params = sub_da
-                 
-            for i in range(n_qubits_data):
-                tqf.ry(qdev, wires=i, params=init_params[:, i])
+            
+            # Fused RY layer
+            # zeros = torch.zeros_like(init_params)
+            # rot_mat = self._get_batch_rot_matrix(n_qubits_data, init_params, zeros, sub_bsz, device, dtype)
+            # qdev.states = apply_unitary_bmm(qdev.states, rot_mat, list(range(n_qubits_data)))
+            self._fast_ry_layer(qdev, init_params)
         
-        # 3. Entanglement (Ancilla -> Data) with Split Control
+        # 3. Entanglement (Ancilla -> Data) with Split Control (Fused per Ancilla)
         # If interaction_wires is provided (Ancilla Mode)
         if interaction_wires is not None and data_wires is not None:
-            for i in range(n_qubits_data):
-                ancilla_idx = i % n_qubits_ancilla
-                ctl = interaction_wires[ancilla_idx]
-                tgt = data_wires[i]
+            # Group data wires by ancilla
+            # Assuming standard pattern: data_wire i controlled by ancilla i % n_ancilla
+            
+            for a_idx in range(n_qubits_ancilla):
+                ctl = interaction_wires[a_idx]
+                tgt_indices = [i for i in range(n_qubits_data) if i % n_qubits_ancilla == a_idx]
                 
-                # mod_params: [n_layers, n_data, 3] OR [B, n_layers, n_data, 3]
-                if mod_params.ndim == 4 and mod_params.shape[0] == sub_bsz:
-                     strength = mod_params[:, 0, i, 0]
-                else:
-                     strength = mod_params[0, i, 0].expand(sub_bsz)
-                     
-                if ancilla_idx % 2 == 0:
-                    tqf.crx(qdev, wires=[ctl, tgt], params=strength)
-                else:
-                    tqf.crz(qdev, wires=[ctl, tgt], params=strength)
+                if not tgt_indices:
+                    continue
+                
+                # Collect params and real data wires
+                params_list = []
+                real_tgt_wires = []
+                
+                for i in tgt_indices:
+                    real_tgt_wires.append(data_wires[i])
+                    # mod_params logic
+                    if mod_params.ndim == 4 and mod_params.shape[0] == sub_bsz:
+                         strength = mod_params[:, 0, i, 0]
+                    else:
+                         strength = mod_params[0, i, 0].expand(sub_bsz)
+                    params_list.append(strength)
+                
+                gate_type = 'rx' if a_idx % 2 == 0 else 'rz'
+                
+                # Get fused matrix
+                # Wires: [ctl, tgt1, tgt2, ...]
+                mat = self._get_fused_controlled_matrix(params_list, gate_type, device, dtype)
+                
+                apply_wires = [ctl] + real_tgt_wires
+                qdev.states = apply_unitary_bmm(qdev.states, mat, apply_wires)
+
         
         # 4. Spatial QCNN Backbone
         for l in range(active_layers):
-            for i in range(n_qubits_data):
-                # qcnn_rot_params: [L, N, 2, 3] OR [B, L, N, 2, 3]
-                if qcnn_rot_params.ndim == 5 and qcnn_rot_params.shape[0] == sub_bsz:
-                    ry_params = qcnn_rot_params[:, l, i, 0, 0]
-                    rz_params = qcnn_rot_params[:, l, i, 1, 0]
-                else:
-                    ry_params = qcnn_rot_params[l, i, 0, 0].expand(sub_bsz)
-                    rz_params = qcnn_rot_params[l, i, 1, 0].expand(sub_bsz)
-                    
-                tqf.ry(qdev, wires=i, params=ry_params)
-                tqf.rz(qdev, wires=i, params=rz_params)
-            for i in range(n_qubits_data):
-                tqf.cnot(qdev, wires=[i, (i + 1) % n_qubits_data])
-            if use_strided_cnot and n_qubits_data >= 4:
-                for i in range(n_qubits_data):
-                    tqf.cnot(qdev, wires=[i, (i + 2) % n_qubits_data])
+            # Optimized: Fused Rotation Layer + CNOTs
+            if qcnn_rot_params.ndim == 5 and qcnn_rot_params.shape[0] == sub_bsz:
+                ry_params = qcnn_rot_params[:, l, :, 0, 0] # [B, N]
+                rz_params = qcnn_rot_params[:, l, :, 1, 0] # [B, N]
+            else:
+                ry_params = qcnn_rot_params[l, :, 0, 0].expand(sub_bsz, -1) # [B, N]
+                rz_params = qcnn_rot_params[l, :, 1, 0].expand(sub_bsz, -1) # [B, N]
+            
+            # 1. Get Batch Rotation Matrix [B, Dim, Dim]
+            # rot_mat = self._get_batch_rot_matrix(n_qubits_data, ry_params, rz_params, sub_bsz, device, dtype)
+            
+            # 2. Get CNOT Layer Matrix [Dim, Dim]
+            # cnot_mat = self._get_cnot_layer_matrix(n_qubits_data, use_strided_cnot, device, dtype)
+            
+            # 3. Fuse: Full_Op = CNOT * Rot
+            # matmul supports broadcasting: [D, D] * [B, D, D] -> [B, D, D]
+            # full_op = torch.matmul(cnot_mat, rot_mat)
+            
+            # 4. Apply
+            # qdev.states = apply_unitary_bmm(qdev.states, full_op, list(range(n_qubits_data)))
+            
+            # Optimized Fusion: Layer-wise (O(dim) for RZ/CNOT)
+            # 1. RY (Batch Matrix Apply)
+            self._fast_ry_layer(qdev, ry_params)
+            
+            # 2. RZ (Diagonal Apply)
+            self._fast_rz_layer(qdev, rz_params)
+            
+            # 3. CNOT (Permutation Apply)
+            self._fast_cnot_layer(qdev, n_qubits_data, use_strided_cnot)
+            
+            # Re-uploading (Fused)
             if reupload_data and (l < active_layers - 1):
-                for i in range(n_qubits_data):
-                    # Fusion Re-uploading
-                    if sub_sa is not None:
-                        tqf.rz(qdev, wires=i, params=(sub_da[:, i] + sub_sa[:, i]))
-                    else:
-                        tqf.rz(qdev, wires=i, params=sub_da[:, i])
+                # Prepare params
+                if sub_sa is not None:
+                    rz_reupload = sub_da + sub_sa
+                else:
+                    rz_reupload = sub_da
+                
+                # zeros = torch.zeros_like(rz_reupload)
+                # Apply RZ (RY=0)
+                # Note: _get_batch_rot_matrix applies RZ * RY. 
+                # If RY params are 0, RY=I. So it applies RZ * I = RZ. Correct.
+                
+                # reupload_mat = self._get_batch_rot_matrix(n_qubits_data, zeros, rz_reupload, sub_bsz, device, dtype)
+                # qdev.states = apply_unitary_bmm(qdev.states, reupload_mat, list(range(n_qubits_data)))
+                self._fast_rz_layer(qdev, rz_reupload)
 
     def __init__(self, channels: int, style_dim: int, n_qubits_data: int = 6, n_qubits_ancilla: int = 2, 
                  n_layers: int = 2, freeze_qcnn: bool = False, device_name: Optional[str] = None,
@@ -1753,7 +2884,9 @@ class QuantumFrontEndQCNN(nn.Module):
                  use_strong_bypass: bool = False, # Strong Classical Bypass
                  stride: int = 2,
                  injection_mode: str = 'simple', # 'simple' or 'rich'
-                 projection_type: str = 'linear'): # 'linear', 'mlp'
+                 projection_type: str = 'linear', # 'linear', 'mlp'
+                 use_mlp_output: bool = False,
+                 use_checkpoint: bool = True):
         super().__init__()
         self.channels = channels
         self.style_dim = style_dim
@@ -1761,6 +2894,8 @@ class QuantumFrontEndQCNN(nn.Module):
         self.use_strong_bypass = bool(use_strong_bypass)
         self.injection_mode = injection_mode
         self.projection_type = projection_type
+        self.use_mlp_output = use_mlp_output
+        self.use_checkpoint = use_checkpoint
         
         assert channels % self.n_groups == 0, f"Channels {channels} must be divisible by n_groups {n_groups}"
         self.channels_per_group = channels // self.n_groups
@@ -1791,7 +2926,7 @@ class QuantumFrontEndQCNN(nn.Module):
         self.reuse_device = True
         self.cache_device = False # Default to False to avoid graph retention issues
         self._qdev_cached = None
-        self._qdev_cached_bsz = None
+        self._qdev_cached_bsz = 0
         self._qdev_cached_devname = None
 
         # Pre-processing: Patch extraction via Unfold + Dimension Reduction
@@ -1873,6 +3008,13 @@ class QuantumFrontEndQCNN(nn.Module):
         # Output Projection (Using Probabilities: 2^N_wires -> Channels_per_group)
         # Independent per group (via Linear since we process groups in batch)
         self.out_proj = nn.Linear(1 << self.n_wires, self.channels_per_group)
+
+        # Output MLP Enhancement
+        if self.use_mlp_output:
+            self.out_mlp = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(self.channels_per_group, self.channels_per_group)
+            )
         
         # Classical Residual
         if self.use_mlp_residual:
@@ -1919,6 +3061,104 @@ class QuantumFrontEndQCNN(nn.Module):
 
     def set_active_layers(self, n: int):
         self.active_layers = min(max(1, n), self.n_layers)
+
+    def _process_chunk(self, chunk_patches, chunk_style, chunk_mod_params, chunk_rot_params, chunk_meas_params):
+        """
+        Process a single chunk of data on the quantum device.
+        Designed to be used with torch.utils.checkpoint.
+        """
+        actual_chunk_size = chunk_patches.shape[0]
+        
+        # Logic for qdev retrieval/creation
+        qdev_chunk = None
+        if self.reuse_device and self._qdev_cached is not None and self._qdev_cached_bsz >= actual_chunk_size:
+             qdev_chunk = self._qdev_cached
+             if hasattr(qdev_chunk, 'reset_states'):
+                 qdev_chunk.reset_states(bsz=actual_chunk_size)
+             else:
+                 # Re-init is safer if reset not available
+                 qdev_chunk = tq.QuantumDevice(n_wires=self.n_wires, bsz=actual_chunk_size, device=self.device_name)
+        else:
+             qdev_chunk = tq.QuantumDevice(n_wires=self.n_wires, bsz=actual_chunk_size, device=self.device_name)
+             if self.reuse_device:
+                 self._qdev_cached = qdev_chunk
+                 self._qdev_cached_bsz = actual_chunk_size
+
+        # For Amplitude Encoding, we will set states explicitly later
+        if self.encoding_type != 'amplitude' and hasattr(qdev_chunk, 'reset_states'):
+            qdev_chunk.reset_states(actual_chunk_size)
+        
+        # Data Encoding (Common)
+        dtype = next(self.data_proj.parameters()).dtype
+        if self.encoding_type == 'linear':
+            chunk_da = self.data_proj(chunk_patches.to(dtype))
+        elif self.encoding_type == 'amplitude':
+            chunk_da = self.data_proj(chunk_patches.to(dtype))
+        else:
+            chunk_da = torch.tanh(self.data_proj(chunk_patches.to(dtype))) * math.pi
+        
+        chunk_sa = torch.tanh(self.style_to_data(chunk_style.to(self.style_to_data.weight.dtype))) * math.pi
+        
+        # State Preparation for Amplitude Encoding
+        if self.encoding_type == 'amplitude':
+            # 1. Normalize Data (L2)
+            norm = torch.norm(chunk_da, p=2, dim=1, keepdim=True) + 1e-8
+            chunk_da_norm = chunk_da / norm
+            
+            # 2. Pad to 2^n_qubits_data
+            target_dim = 2 ** self.n_qubits_data
+            curr_dim = chunk_da_norm.shape[1]
+            
+            if curr_dim < target_dim:
+                padding = torch.zeros(actual_chunk_size, target_dim - curr_dim, device=chunk_da.device, dtype=chunk_da.dtype)
+                data_state = torch.cat([chunk_da_norm, padding], dim=1)
+            elif curr_dim > target_dim:
+                data_state = chunk_da_norm[:, :target_dim]
+                norm = torch.norm(data_state, p=2, dim=1, keepdim=True) + 1e-8
+                data_state = data_state / norm
+            else:
+                data_state = chunk_da_norm
+            
+            # 3. Handle Ancilla (Tensor Product)
+            if self.n_wires_ancilla > 0:
+                ancilla_dim = 2 ** self.n_wires_ancilla
+                ancilla_state = torch.zeros(actual_chunk_size, ancilla_dim, device=chunk_da.device, dtype=chunk_da.dtype)
+                ancilla_state[:, 0] = 1.0
+                full_state_real = torch.einsum('bi,bj->bij', data_state, ancilla_state).reshape(actual_chunk_size, -1)
+            else:
+                full_state_real = data_state
+
+            # 4. Set States (Complex)
+            flat_state = torch.complex(full_state_real, torch.zeros_like(full_state_real))
+            state_shape = [actual_chunk_size] + [2] * self.n_wires
+            qdev_chunk.states = flat_state.reshape(state_shape)
+
+        # Apply Circuit (Integrated Fusion)
+        self._apply_fusion_circuit(
+            qdev_chunk, actual_chunk_size, chunk_da, chunk_sa, 
+            None, # interaction_wires
+            None, # data_wires
+            chunk_mod_params, chunk_rot_params,
+            self.n_qubits_data, self.n_qubits_ancilla, self.active_layers,
+            self.use_strided_cnot, self.reupload_data, self.encoding_type
+        )
+        
+        # Trainable Measurement Basis
+        for i in range(self.n_qubits_data):
+            tqf.u3(qdev_chunk, wires=i, params=chunk_meas_params[:, i])
+            
+        # Measurement (Probabilities)
+        if hasattr(qdev_chunk, 'get_states_1d'): 
+            states = qdev_chunk.get_states_1d()
+        elif hasattr(qdev_chunk, 'get_states'): 
+            states = qdev_chunk.get_states()
+        else: 
+            states = qdev_chunk.states
+        
+        # [Optimization] Avoid sqrt in abs() since we square it anyway
+        # probs = (states.abs() ** 2)
+        probs = states.real**2 + states.imag**2
+        return probs
 
     def forward(self, x: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         # style can be 'emb' (raw input) if time_emb_module is used
@@ -2024,41 +3264,9 @@ class QuantumFrontEndQCNN(nn.Module):
 
         outs = []
         
-        # Create Device Once
-        # Note: tq.QuantumDevice(bsz=N) allocates memory. 
-        # We create a device large enough for the chunk.
-        current_chunk_size = min(sub_bsz, chunk_size_limit)
-        
-        # Reuse strategy: Use a persistent device if enabled
-        if self.reuse_device and self._qdev_cached is not None and self._qdev_cached_bsz >= current_chunk_size:
-             qdev = self._qdev_cached
-             # Reset state is done implicitly by new encoding usually, or we force reset
-             if hasattr(qdev, 'reset_states'):
-                 qdev.reset_states(bsz=current_chunk_size)
-             else:
-                 # Re-init is safer if reset not available, but slower
-                 qdev = tq.QuantumDevice(n_wires=self.n_wires, bsz=current_chunk_size, device=self.device_name)
-        else:
-             qdev = tq.QuantumDevice(n_wires=self.n_wires, bsz=current_chunk_size, device=self.device_name)
-             if self.reuse_device:
-                 self._qdev_cached = qdev
-                 self._qdev_cached_bsz = current_chunk_size
-        
+        # Process chunks with optional checkpointing
         for s in range(0, sub_bsz, chunk_size_limit):
             e = min(s + chunk_size_limit, sub_bsz)
-            actual_chunk_size = e - s
-            
-            # If the last chunk is smaller, we might need a smaller device or just pad/slice
-            # TQ requires bsz match exactly usually.
-            if actual_chunk_size != qdev.bsz:
-                # Resize or create temp
-                qdev_chunk = tq.QuantumDevice(n_wires=self.n_wires, bsz=actual_chunk_size, device=self.device_name)
-            else:
-                qdev_chunk = qdev
-                # Important: Reset states to |0>
-            # For Amplitude Encoding, we will set states explicitly later
-            if self.encoding_type != 'amplitude' and hasattr(qdev_chunk, 'reset_states'):
-                qdev_chunk.reset_states(actual_chunk_size)
             
             chunk_patches = sub_patches_flat[s:e]
             chunk_style = sub_style[s:e]
@@ -2068,93 +3276,27 @@ class QuantumFrontEndQCNN(nn.Module):
             chunk_rot_params = qcnn_rot_params_expanded[s:e]
             chunk_meas_params = measure_params_expanded[s:e]
             
-            # Data Encoding (Common)
-            dtype = next(self.data_proj.parameters()).dtype
-            if self.encoding_type == 'linear':
-                chunk_da = self.data_proj(chunk_patches.to(dtype))
-            elif self.encoding_type == 'amplitude':
-                # Amplitude Encoding: Use projected features directly (Linear)
-                # They will be normalized and mapped to states below
-                chunk_da = self.data_proj(chunk_patches.to(dtype))
+            if self.use_checkpoint and self.training:
+                # Use checkpointing to save memory
+                # Note: inputs must be tensors. All args are tensors here.
+                # checkpoint_utils.checkpoint handles the backward pass by re-running the function
+                probs = checkpoint_utils.checkpoint(
+                    self._process_chunk,
+                    chunk_patches,
+                    chunk_style,
+                    chunk_mod_params,
+                    chunk_rot_params,
+                    chunk_meas_params,
+                    use_reentrant=False # Recommended for newer PyTorch
+                )
             else:
-                chunk_da = torch.tanh(self.data_proj(chunk_patches.to(dtype))) * math.pi
-            
-            chunk_sa = torch.tanh(self.style_to_data(chunk_style.to(self.style_to_data.weight.dtype))) * math.pi
-            
-            # State Preparation for Amplitude Encoding
-            if self.encoding_type == 'amplitude':
-                # 1. Normalize Data (L2)
-                # chunk_da: [B, D]
-                # Avoid div by zero
-                norm = torch.norm(chunk_da, p=2, dim=1, keepdim=True) + 1e-8
-                chunk_da_norm = chunk_da / norm
-                
-                # 2. Pad to 2^n_qubits_data
-                target_dim = 2 ** self.n_qubits_data
-                curr_dim = chunk_da_norm.shape[1]
-                
-                if curr_dim < target_dim:
-                    padding = torch.zeros(actual_chunk_size, target_dim - curr_dim, device=chunk_da.device, dtype=chunk_da.dtype)
-                    data_state = torch.cat([chunk_da_norm, padding], dim=1)
-                elif curr_dim > target_dim:
-                    data_state = chunk_da_norm[:, :target_dim]
-                    # Re-normalize after truncation? Yes
-                    norm = torch.norm(data_state, p=2, dim=1, keepdim=True) + 1e-8
-                    data_state = data_state / norm
-                else:
-                    data_state = chunk_da_norm
-                
-                # 3. Handle Ancilla (Tensor Product)
-                # State = |Data> (x) |Ancilla=0>
-                # Ancilla state is [1, 0, ..., 0] of size 2^n_ancilla
-                if self.n_wires_ancilla > 0:
-                    ancilla_dim = 2 ** self.n_wires_ancilla
-                    # Construct full state via Kronecker product
-                    # Optimized: Since ancilla is |0...0>, we just pad zeros in the interleaved manner?
-                    # No, A (x) [1, 0...] = [a0, 0..., a1, 0...]
-                    # This is equivalent to inserting (ancilla_dim - 1) zeros after each element of data_state
-                    # Or simpler: torch.kron
-                    
-                    # Create Ancilla State [1, 0...]
-                    ancilla_state = torch.zeros(actual_chunk_size, ancilla_dim, device=chunk_da.device, dtype=chunk_da.dtype)
-                    ancilla_state[:, 0] = 1.0
-                    
-                    # Batch Kron: A [B, N], B [B, M] -> [B, N*M]
-                    # torch.einsum 'bi,bj->bij' -> flatten
-                    full_state_real = torch.einsum('bi,bj->bij', data_state, ancilla_state).reshape(actual_chunk_size, -1)
-                else:
-                    full_state_real = data_state
-
-                # 4. Set States (Complex)
-                flat_state = torch.complex(full_state_real, torch.zeros_like(full_state_real))
-                # Reshape to [B, 2, 2, ..., 2] required by TQ gate operations
-                state_shape = [actual_chunk_size] + [2] * self.n_wires
-                qdev_chunk.states = flat_state.reshape(state_shape)
-
-            # Apply Circuit (Integrated Fusion)
-            self._apply_fusion_circuit(
-                qdev_chunk, actual_chunk_size, chunk_da, chunk_sa, 
-                None, # interaction_wires (not used in simplified grouped mode)
-                None, # data_wires (implicit 0..n)
-                chunk_mod_params, chunk_rot_params,
-                self.n_qubits_data, self.n_qubits_ancilla, self.active_layers,
-                self.use_strided_cnot, self.reupload_data, self.encoding_type
-            )
-            
-            # Trainable Measurement Basis
-            for i in range(self.n_qubits_data):
-                tqf.u3(qdev_chunk, wires=i, params=chunk_meas_params[:, i])
-                
-            # Measurement (Probabilities)
-            if hasattr(qdev_chunk, 'get_states_1d'): 
-                states = qdev_chunk.get_states_1d()
-            elif hasattr(qdev_chunk, 'get_states'): 
-                states = qdev_chunk.get_states()
-            else: 
-                states = qdev_chunk.states
-            
-            # Probabilities: |psi|^2
-            probs = (states.abs() ** 2)
+                probs = self._process_chunk(
+                    chunk_patches,
+                    chunk_style,
+                    chunk_mod_params,
+                    chunk_rot_params,
+                    chunk_meas_params
+                )
             outs.append(probs)
 
         # Concat chunks
@@ -2164,6 +3306,14 @@ class QuantumFrontEndQCNN(nn.Module):
         # [sub_bsz, out_channels_per_group]
         quant_proj = self.out_proj(quant_out_flat.to(self.out_proj.weight.dtype))
         
+        # Add Activation and Linear Layer (Optional Enhancement)
+        # Check if we should apply this enhancement (default to False to preserve old behavior unless flag is set?)
+        # User requested to add it, so let's add it. 
+        # To be safe, we can add it as a new attribute if it doesn't exist, or just modify the architecture.
+        # Given "current hybrid architecture", and "optimize model effect", I will add it if self.use_mlp_output is True.
+        if getattr(self, 'use_mlp_output', False):
+             quant_proj = self.out_mlp(quant_proj)
+
         # Reshape back to [B*L, groups, channels_per_group]
         quant_grouped = quant_proj.view(bsz_total, self.n_groups, self.channels_per_group)
         
@@ -3220,7 +4370,7 @@ class QuantumAdapterHybridLite(nn.Module):
             input_dim=in_channels,
             N_QUBITS=6,
             qk_dim=qk_dim,
-            n_heads=num_heads,
+            num_heads=num_heads,
             device_name=device_name,
             **kwargs
         )
@@ -3254,7 +4404,7 @@ class QuantumAdapterHybrid(nn.Module):
             input_dim=in_channels,
             N_QUBITS=6, # Fixed for now
             qk_dim=qk_dim,
-            n_heads=num_heads, # Passed to QuantumAttention64 base
+            num_heads=num_heads, # Passed to QuantumAttention64 base
             device_name=device_name,
             **kwargs
         )

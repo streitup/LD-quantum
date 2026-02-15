@@ -1,0 +1,148 @@
+Running SOTA Ablation Experiment on cuda
+Loading dataset from /home/zzn/qfl_tq/ffhq_workspace/100-shot-obama-128.zip
+Pre-loading data to memory...
+Loaded 100 images. Shape: torch.Size([100, 3, 16, 16])
+Data Resolution: 3x16x16
+/home/zzn/.local/lib/python3.12/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/zzn/.local/lib/python3.12/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+
+--- Training Model: 1. Classic Attention ---
+  Total Block Params: 59402
+  Epoch 1/20 | Loss: 0.160865
+  Epoch 2/20 | Loss: 0.046103
+  Epoch 3/20 | Loss: 0.027474
+  Epoch 4/20 | Loss: 0.018890
+  Epoch 5/20 | Loss: 0.014384
+  Epoch 6/20 | Loss: 0.012514
+  Epoch 7/20 | Loss: 0.010518
+  Epoch 8/20 | Loss: 0.009428
+  Epoch 9/20 | Loss: 0.009031
+  Epoch 10/20 | Loss: 0.008457
+  Epoch 11/20 | Loss: 0.008323
+  Epoch 12/20 | Loss: 0.008069
+  Epoch 13/20 | Loss: 0.007859
+  Epoch 14/20 | Loss: 0.007728
+  Epoch 15/20 | Loss: 0.007552
+  Epoch 16/20 | Loss: 0.007546
+  Epoch 17/20 | Loss: 0.007430
+  Epoch 18/20 | Loss: 0.007476
+  Epoch 19/20 | Loss: 0.007546
+  Epoch 20/20 | Loss: 0.007550
+  [Result] PSNR: 23.60 | SSIM: 0.9503 | LPIPS: 9908.92
+  [Perf] Time: 224.27s
+
+--- Training Model: 2. QSANN (Amplitude) ---
+  Quantum Adapter Params: 13469
+  Total Block Params: 56231
+  Epoch 1/20 | Loss: 0.144838
+  Epoch 2/20 | Loss: 0.046591
+  Epoch 3/20 | Loss: 0.024663
+  Epoch 4/20 | Loss: 0.017118
+  Epoch 5/20 | Loss: 0.014114
+  Epoch 6/20 | Loss: 0.011210
+  Epoch 7/20 | Loss: 0.009459
+  Epoch 8/20 | Loss: 0.008902
+  Epoch 9/20 | Loss: 0.008114
+  Epoch 10/20 | Loss: 0.007893
+  Epoch 11/20 | Loss: 0.007594
+  Epoch 12/20 | Loss: 0.007412
+  Epoch 13/20 | Loss: 0.007258
+  Epoch 14/20 | Loss: 0.007092
+  Epoch 15/20 | Loss: 0.007065
+  Epoch 16/20 | Loss: 0.006938
+  Epoch 17/20 | Loss: 0.007037
+  Epoch 18/20 | Loss: 0.006948
+  Epoch 19/20 | Loss: 0.006927
+  Epoch 20/20 | Loss: 0.006852
+  [Result] PSNR: 23.54 | SSIM: 0.9597 | LPIPS: 10394.74
+  [Perf] Time: 250.52s
+
+--- Training Model: 3. SOTA (Dense Angle) ---
+  Quantum Adapter Params: 19249
+  Total Block Params: 62011
+  Epoch 1/20 | Loss: 0.158778
+  Epoch 2/20 | Loss: 0.041614
+  Epoch 3/20 | Loss: 0.024964
+  Epoch 4/20 | Loss: 0.016948
+  Epoch 5/20 | Loss: 0.012787
+  Epoch 6/20 | Loss: 0.010892
+  Epoch 7/20 | Loss: 0.009487
+  Epoch 8/20 | Loss: 0.008611
+  Epoch 9/20 | Loss: 0.007682
+  Epoch 10/20 | Loss: 0.007608
+  Epoch 11/20 | Loss: 0.007355
+  Epoch 12/20 | Loss: 0.007150
+  Epoch 13/20 | Loss: 0.006942
+  Epoch 14/20 | Loss: 0.006860
+  Epoch 15/20 | Loss: 0.006734
+  Epoch 16/20 | Loss: 0.006745
+  Epoch 17/20 | Loss: 0.006683
+  Epoch 18/20 | Loss: 0.006686
+  Epoch 19/20 | Loss: 0.006712
+  Epoch 20/20 | Loss: 0.006649
+  [Result] PSNR: 23.62 | SSIM: 0.9622 | LPIPS: 10091.93
+  [Perf] Time: 293.53s
+
+--- Training Model: 4. SOTA (Dense, 8 Qubits) ---
+  Quantum Adapter Params: 41237
+  Total Block Params: 83999
+  Epoch 1/20 | Loss: 0.116097
+  Epoch 2/20 | Loss: 0.032340
+  Epoch 3/20 | Loss: 0.020585
+  Epoch 4/20 | Loss: 0.015081
+  Epoch 5/20 | Loss: 0.011540
+  Epoch 6/20 | Loss: 0.009544
+  Epoch 7/20 | Loss: 0.008297
+  Epoch 8/20 | Loss: 0.007782
+  Epoch 9/20 | Loss: 0.007352
+  Epoch 10/20 | Loss: 0.006935
+  Epoch 11/20 | Loss: 0.006750
+  Epoch 12/20 | Loss: 0.006597
+  Epoch 13/20 | Loss: 0.006554
+  Epoch 14/20 | Loss: 0.006517
+  Epoch 15/20 | Loss: 0.006418
+  Epoch 16/20 | Loss: 0.006371
+  Epoch 17/20 | Loss: 0.006356
+  Epoch 18/20 | Loss: 0.006357
+  Epoch 19/20 | Loss: 0.006305
+  Epoch 20/20 | Loss: 0.006264
+  [Result] PSNR: 25.46 | SSIM: 0.9618 | LPIPS: 8432.66
+  [Perf] Time: 351.20s
+
+--- Training Model: 5. SOTA (Hybrid Lite) ---
+  Quantum Adapter Params: 14217
+  Total Block Params: 56979
+  Epoch 1/20 | Loss: 0.131618
+  Epoch 2/20 | Loss: 0.039691
+  Epoch 3/20 | Loss: 0.022229
+  Epoch 4/20 | Loss: 0.015639
+  Epoch 5/20 | Loss: 0.012322
+  Epoch 6/20 | Loss: 0.010661
+  Epoch 7/20 | Loss: 0.009111
+  Epoch 8/20 | Loss: 0.008360
+  Epoch 9/20 | Loss: 0.007856
+  Epoch 10/20 | Loss: 0.007600
+  Epoch 11/20 | Loss: 0.007290
+  Epoch 12/20 | Loss: 0.007155
+  Epoch 13/20 | Loss: 0.006995
+  Epoch 14/20 | Loss: 0.006850
+  Epoch 15/20 | Loss: 0.006819
+  Epoch 16/20 | Loss: 0.006675
+  Epoch 17/20 | Loss: 0.006790
+  Epoch 18/20 | Loss: 0.006684
+  Epoch 19/20 | Loss: 0.006748
+  Epoch 20/20 | Loss: 0.006509
+  [Result] PSNR: 25.55 | SSIM: 0.9632 | LPIPS: 7758.40
+  [Perf] Time: 294.16s
+
+
+=== Final Benchmark Results ===
+Model                     | Params     | PSNR     | SSIM     | LPIPS    | Time (s)
+--------------------------------------------------------------------------------
+1. Classic Attention      | 59402      | 23.60    | 0.9503   | 9908.92  | 224.27  
+2. QSANN (Amplitude)      | 56231      | 23.54    | 0.9597   | 10394.74 | 250.52  
+3. SOTA (Dense Angle)     | 62011      | 23.62    | 0.9622   | 10091.93 | 293.53  
+4. SOTA (Dense, 8 Qubits) | 83999      | 25.46    | 0.9618   | 8432.66  | 351.20  
+5. SOTA (Hybrid Lite)     | 56979      | 25.55    | 0.9632   | 7758.40  | 294.16  

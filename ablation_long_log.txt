@@ -1,0 +1,44 @@
+Running SOTA Ablation Experiment on cuda
+Loading dataset from /home/zzn/qfl_tq/ffhq_workspace/100-shot-obama-128.zip
+Data Resolution: 3x16x16
+/home/zzn/.local/lib/python3.12/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/zzn/.local/lib/python3.12/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+
+--- Training Model: 1. Classic Attention ---
+  Total Block Params: 59402
+Traceback (most recent call last):
+  File "/home/zzn/qfl_tq/LD-Diffusion-quantum-v3/benchmark_sota_ablation.py", line 435, in <module>
+    run_experiment()
+  File "/home/zzn/qfl_tq/LD-Diffusion-quantum-v3/benchmark_sota_ablation.py", line 353, in run_experiment
+    x = block(x, t_emb)
+        ^^^^^^^^^^^^^^^
+  File "/home/zzn/.local/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zzn/.local/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zzn/qfl_tq/LD-Diffusion-quantum-v3/Training Codes of LD-Diffusion/training/networks.py", line 391, in forward
+    x = self.quantum_frontend(x, emb)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zzn/.local/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zzn/.local/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zzn/qfl_tq/LD-Diffusion-quantum-v3/Training Codes of LD-Diffusion/training/quantum_transformer.py", line 2450, in forward
+    self._apply_fusion_circuit(
+  File "/home/zzn/qfl_tq/LD-Diffusion-quantum-v3/Training Codes of LD-Diffusion/training/quantum_transformer.py", line 2038, in _apply_fusion_circuit
+    tqf.cnot(qdev, wires=[i, (i + 1) % n_qubits_data])
+  File "/home/zzn/.local/lib/python3.12/site-packages/torchquantum/functional/paulix.py", line 233, in cnot
+    gate_wrapper(
+  File "/home/zzn/.local/lib/python3.12/site-packages/torchquantum/functional/gate_wrapper.py", line 446, in gate_wrapper
+    q_device.states = apply_unitary_bmm(state, matrix, wires)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/zzn/.local/lib/python3.12/site-packages/torchquantum/functional/gate_wrapper.py", line 127, in apply_unitary_bmm
+    permuted = state.permute(permute_to).reshape([original_shape[0], mat.shape[-1], -1])
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB. GPU 0 has a total capacity of 23.60 GiB of which 16.56 MiB is free. Process 400941 has 970.00 MiB memory in use. Process 613542 has 970.00 MiB memory in use. Process 2786851 has 14.32 GiB memory in use. Including non-PyTorch memory, this process has 7.32 GiB memory in use. Of the allocated memory 7.02 GiB is allocated by PyTorch, and 2.37 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

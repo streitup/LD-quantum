@@ -1,0 +1,17 @@
+{
+    "0. Pure Classic": {
+        "error": "Expected number of channels in input to be divisible by num_groups, but got input of shape [8, 3, 16, 16] and num_groups=16"
+    },
+    "1. QSANN (Baseline)": {
+        "error": "Expected number of channels in input to be divisible by num_groups, but got input of shape [8, 3, 16, 16] and num_groups=16"
+    },
+    "2. SOTA (Enc-Only)": {
+        "error": "Expected number of channels in input to be divisible by num_groups, but got input of shape [8, 3, 16, 16] and num_groups=16"
+    },
+    "3. SOTA (Enc+Grouped)": {
+        "error": "Expected number of channels in input to be divisible by num_groups, but got input of shape [8, 3, 16, 16] and num_groups=16"
+    },
+    "4. SOTA (Full)": {
+        "error": "Expected number of channels in input to be divisible by num_groups, but got input of shape [8, 3, 16, 16] and num_groups=16"
+    }
+}

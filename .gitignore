@@ -28,6 +28,11 @@ env/
 **/*.pth
 **/*.pt
 
+# pictures
+**/*.png
+**/*.jpg
+**/*.jpeg
+
 # Datasets and archives
 **/*.zip
 **/*.tar
