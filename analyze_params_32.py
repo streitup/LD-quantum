@@ -1,4 +1,3 @@
-
 import os
 import sys
 import torch
@@ -17,25 +16,32 @@ training.networks.QuantumFrontEndQCNN = ExperimentalQuantumFrontEnd
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
-def run_param_analysis():
-    # Config
-    C_model = 128
+def run_param_analysis_latent():
+    # Config for Latent Diffusion (32x32 Latent Space)
+    # Typically Latent Diffusion (LDM) uses 4 channels (from VAE)
+    # But inside the UNet, channels grow. 
+    # Let's assume a typical middle-block channel count for 32x32 resolution.
+    # If base is 64, layer 2 might be 128 or 256.
+    # Let's use 256 to simulate a heavy workload in latent space.
+    C_model = 256 
     emb_dim = C_model * 4
-    device = 'cpu' # Sufficient for param counting
+    device = 'cpu' 
+    
+    print(f"Configuration: Latent Space 32x32 | Channels: {C_model} | Embedding: {emb_dim}")
     
     # Define Models
     models_config = {
-        "Qattn-QDM": {
+        "Qattn-QDM (Latent)": {
             "type": "UNetBlock",
             "kwargs": {
                 "use_qcnn_frontend": True,
                 "use_quantum_transformer": True,
                 "attention": True,
                 "use_mlp_output": True,
-                "affine_mode": "q_head" # Assuming this is default for Qattn-QDM
+                "affine_mode": "q_head" 
             }
         },
-        "w/o G-QCNN": {
+        "w/o G-QCNN (Latent)": {
             "type": "UNetBlock",
             "kwargs": {
                 "use_qcnn_frontend": False, # Disabled
@@ -45,7 +51,7 @@ def run_param_analysis():
                 "affine_mode": "q_head"
             }
         },
-        "w/o Q-SA": {
+        "w/o Q-SA (Latent)": {
             "type": "UNetBlock",
             "kwargs": {
                 "use_qcnn_frontend": True,
@@ -55,7 +61,7 @@ def run_param_analysis():
                 "affine_mode": "q_head"
             }
         },
-        "w/o Group": {
+        "w/o Group (Latent)": {
             "type": "UNetBlock",
             "kwargs": {
                 "use_qcnn_frontend": True,
@@ -63,26 +69,24 @@ def run_param_analysis():
                 "attention": True,
                 "use_mlp_output": True,
                 "affine_mode": "q_head",
-                "use_grouped_qcnn": False # New flag to disable grouping
+                "use_grouped_qcnn": False 
             }
         }
     }
     
-    print("\n" + "="*60)
-    print("PARAMETER COUNT ANALYSIS (Ablation Study)")
-    print("="*60)
-    print(f"{'Algorithm':<25} | {'Total Params':<15} | {'Diff vs Qattn-QDM':<15}")
-    print("-" * 60)
+    print("\n" + "="*80)
+    print("PARAMETER COUNT ANALYSIS (Latent Diffusion 32x32)")
+    print("="*80)
+    print(f"{'Algorithm':<25} | {'Params':<10} | {'Size (MB)':<10} | {'Diff (MB)':<10}")
+    print("-" * 80)
     
     baseline_params = 0
+    baseline_size = 0
     
     for i, (model_name, config) in enumerate(models_config.items()):
-        # Hack for "w/o Group" which requires modifying the class behavior or passing a specific kwarg
-        # Since networks.py UNetBlock might not accept 'use_grouped_qcnn', we might need to patch it 
-        # or assume it passes kwargs down to QuantumFrontEndQCNN.
-        # networks.py: UNetBlock passes **kwargs to QuantumFrontEndQCNN.
-        
         # Init Model
+        # Note: We simulate input resolution implicitly by the block structure, 
+        # but param count is resolution-agnostic for Conv/Attention weights.
         model = UNetBlock(
             in_channels=C_model,
             out_channels=C_model,
@@ -92,18 +96,19 @@ def run_param_analysis():
         ).to(device)
         
         params = count_params(model)
+        size_mb = params * 4 / (1024 * 1024)
         
         if i == 0:
             baseline_params = params
-            diff = 0
+            baseline_size = size_mb
+            diff_mb = 0
+            diff_str = "-"
         else:
             diff = params - baseline_params
+            diff_mb = diff * 4 / (1024 * 1024)
+            diff_str = f"{diff_mb:+.2f}"
             
-        print(f"{model_name:<25} | {params:<15} | {diff:<15}")
-            
-        print(f"{model_name:<25} | {params:<15} | {diff:<+15}")
-        
-    print("-" * 60)
+        print(f"{model_name:<25} | {params:<10} | {size_mb:<10.2f} | {diff_str:<10}")
 
 if __name__ == "__main__":
-    run_param_analysis()
+    run_param_analysis_latent()

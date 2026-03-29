@@ -100,6 +100,11 @@ def parse_int_list(s):
 @click.option('--quantum-qcnn-chunk', help='Chunk size for QCNN batched simulation (0 means no chunking).', metavar='INT', type=click.IntRange(min=0), default=16384, show_default=True)
 @click.option('--quantum-qcnn-strided', help='Enable strided CNOT entanglement in QCNN.', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--quantum-qcnn-reupload', help='Enable data re-uploading between QCNN layers.', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--qcnn-resolutions', help='List of resolutions to enable QCNN (e.g. "32,16,8"). Default None (All).', metavar='LIST', type=parse_int_list, default=None, show_default=True)
+@click.option('--qcnn-groups', help='Number of groups for G-QCNN (1 means no grouping). Default None (Auto).', metavar='INT', type=click.IntRange(min=1), default=None, show_default=True)
+@click.option('--qcnn-n-qubits', help='Number of qubits for QCNN (fixed per spatial pos).', metavar='INT', type=click.IntRange(min=1), default=6, show_default=True)
+@click.option('--qcnn-depth', help='Depth of QCNN layers.', metavar='INT', type=click.IntRange(min=1), default=None, show_default=True)
+@click.option('--attn-resolutions', help='List of resolutions to enable Attention (e.g. "32,16,8"). Default None (Use model default).', metavar='LIST', type=parse_int_list, default=None, show_default=True)
 
 # I/O-related.
 @click.option('--desc',          help='String to include in result dir name', metavar='STR',        type=str)
@@ -242,6 +247,7 @@ def main(**kwargs):
             force_fp32_attention=opts.force_fp32_attn,
             attn_chunk_size=opts.quantum_attn_chunk,
             device_name=c.device,
+            use_checkpoint=True,
         )
         if opts.quantum_tau is not None:
             adapter_kwargs['tau'] = float(opts.quantum_tau)
@@ -258,6 +264,12 @@ def main(**kwargs):
     c.network_kwargs.update(qcnn_chunk_size=opts.quantum_qcnn_chunk)
     c.network_kwargs.update(qcnn_use_strided=opts.quantum_qcnn_strided)
     c.network_kwargs.update(qcnn_reupload=opts.quantum_qcnn_reupload)
+    c.network_kwargs.update(qcnn_resolutions=opts.qcnn_resolutions)
+    c.network_kwargs.update(qcnn_groups=opts.qcnn_groups)
+    c.network_kwargs.update(qcnn_n_qubits=opts.qcnn_n_qubits)
+    c.network_kwargs.update(qcnn_depth=opts.qcnn_depth)
+    if opts.attn_resolutions is not None:
+        c.network_kwargs.update(attn_resolutions=opts.attn_resolutions)
 
     # No legacy adapter path: quantum options are active only when arch=quantum_transformer.
 

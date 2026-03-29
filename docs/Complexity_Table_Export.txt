@@ -1,0 +1,21 @@
+# 算法复杂度对比汇总表 (Updated for Hybrid Encoding)
+
+此文件包含 CSV (逗号分隔) 和 TSV (制表符分隔) 格式的表格数据，方便直接复制到 Excel 或 Word 中。
+
+## 1. CSV 格式 (Excel)
+
+算法模型,编码方式,真实量子时间复杂度,经典模拟时间复杂度,参数量规模,备注
+经典 CNN,N/A,N/A,O(M * C_in * C_out * K^2),O(C_in * C_out),计算量随通道数二次增长
+SOTA_QCNN (HEA),角度编码,O(M * S_shots * L),O(M * 2^N * C_out),O(N * L + 2^N * C_out),通道解耦，硬件友好
+经典 Self-Attention,N/A,N/A,O(S^2 * D + S * D^2),O(D^2),线性投影参数量大
+QSANN (基线),角度/幅度,O(S^2 * S_shots * L),O(S^2 * 2^N),O(N * L),量子调用次数 O(S^2)
+SOTA_QAttention (HEA),幅度编码,O(S * S_shots * 2^N),O(S * 2^N * 2^N),O(N * L + 2^N * d_k),高维压缩，线性复杂度
+
+## 2. TSV 格式 (Word / Excel)
+
+算法模型	编码方式	真实量子时间复杂度	经典模拟时间复杂度	参数量规模	备注
+经典 CNN	N/A	N/A	O(M * C_in * C_out * K^2)	O(C_in * C_out)	计算量随通道数二次增长
+SOTA_QCNN (HEA)	角度编码	O(M * S_shots * L)	O(M * 2^N * C_out)	O(N * L + 2^N * C_out)	通道解耦，硬件友好
+经典 Self-Attention	N/A	N/A	O(S^2 * D + S * D^2)	O(D^2)	线性投影参数量大
+QSANN (基线)	角度/幅度	O(S^2 * S_shots * L)	O(S^2 * 2^N)	O(N * L)	量子调用次数 O(S^2)
+SOTA_QAttention (HEA)	幅度编码	O(S * S_shots * 2^N)	O(S * 2^N * 2^N)	O(N * L + 2^N * d_k)	高维压缩，线性复杂度

@@ -1,0 +1,31 @@
+Metrics Calculation Report
+==========================
+Reference Images: /home/zzn/qfl_tq/LD-Diffusion-quantum-v3/panda_32_real/temp_real_32x32
+FID Reference Stats: fid-refs/panda-32-real.npz
+
+----------------------------------------
+Epoch: 5000
+FID Output:
+Loading dataset reference statistics from "fid-refs/panda-32-real.npz"...
+Loading Inception-v3 model...
+Loading images from "out_images_5000"...
+Calculating statistics for 500 images...
+Calculating FID...
+17.554
+Precision/Recall Output:
+Loading Real images from /home/zzn/qfl_tq/LD-Diffusion-quantum-v3/panda_32_real/temp_real_32x32
+Found 100 images in /home/zzn/qfl_tq/LD-Diffusion-quantum-v3/panda_32_real/temp_real_32x32
+Loading Fake images from out_images_5000
+Found 500 images in out_images_5000
+Real Features: (100, 2048)
+Fake Features: (500, 2048)
+Computing k-NN (k=3)...
+Computing Precision...
+Computing k-NN (k=3)...
+Computing Recall...
+------------------------------
+Precision: 0.9620
+Recall:    0.9700
+------------------------------
+Results saved to pr_results.txt
+

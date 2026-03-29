@@ -1,0 +1,4 @@
+Real: /home/zzn/qfl_tq/LD-Diffusion-quantum-v3/panda_32_real/temp_real_32x32
+Fake: out_images_classical_b32_1000
+Precision: 0.686000
+Recall: 0.520000
