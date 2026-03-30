@@ -34,7 +34,7 @@ env/
 **/*.jpeg
 
 # Datasets and archives
-**/*.zip
+
 **/*.tar
 **/*.tar.gz
 
